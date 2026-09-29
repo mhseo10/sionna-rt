@@ -10,3 +10,4 @@ Tutorials
     tutorials/Radio-Maps.ipynb
     tutorials/Scattering.ipynb
     tutorials/Scene-Edit.ipynb
+    tutorials/RCS.ipynb

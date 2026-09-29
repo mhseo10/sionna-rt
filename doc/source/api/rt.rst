@@ -13,6 +13,7 @@ API Documentation
     radio_maps
     radio_map_solvers
     radio_materials
+    RCS <rcs>
     scene
     scene_object
     utils

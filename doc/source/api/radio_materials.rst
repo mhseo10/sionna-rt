@@ -76,10 +76,17 @@ Moreover, by default, the scattering coefficient, :math:`S`, of these materials 
 
 .. itu-materials-table::
 
+Finally, the :class:`~sionna.rt.AbsorberRadioMaterial` class implements a
+perfect absorber, i.e., a material that scatters no energy at all. Objects made
+of this material cast radio shadows but never contribute to a path. It is used,
+for example, by sensing targets (:class:`~sionna.rt.rcs.SensingTarget`), whose
+scattering response is described by a scattering model rather than by a radio
+material.
+
 
 .. autoclass:: sionna.rt.RadioMaterialBase
     :members:
-    :exclude-members: is_used, add_object, remove_object
+    :exclude-members: is_used
 
 .. autoclass:: sionna.rt.RadioMaterial
     :members:
@@ -87,6 +94,10 @@ Moreover, by default, the scattering coefficient, :math:`S`, of these materials 
 
 .. autoclass:: sionna.rt.ITURadioMaterial
     :members:
+
+.. autoclass:: sionna.rt.AbsorberRadioMaterial
+    :members:
+    :exclude-members: traverse, to_string, sample, eval, pdf
 
 
 Scattering Patterns

@@ -10,7 +10,7 @@ where = ["src"]
 
 [project]
 name = "sionna-rt"
-version = "2.1.0"
+version = "2.2.0"
 description = "Sionna RT - A hardware-accelerated differentiable ray tracer for radio propagation modeling"
 readme = "README.md"
 license = {text = "Apache-2.0"}

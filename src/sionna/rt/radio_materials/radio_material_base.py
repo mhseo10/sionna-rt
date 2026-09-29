@@ -29,9 +29,6 @@ class RadioMaterialBase(mi.BSDF):
     def __init__(self, props: mi.Properties):
         super().__init__(props)
 
-        # Counter indicating how many objects are using `self`
-        self._count_using_objects = 0
-
         # Scene object that uses this radio material
         self._scene: weakref.ref[scene_module.Scene] = lambda: None
 
@@ -52,7 +49,8 @@ class RadioMaterialBase(mi.BSDF):
     @property
     def scene(self):
         """Get/set the scene used by the radio material.
-        Note that the scene can only be set once.
+        Note that the scene can only be set once, until the material is removed
+        from that scene.
 
         :type: :class:`~sionna.rt.Scene`
         """
@@ -66,6 +64,15 @@ class RadioMaterialBase(mi.BSDF):
             raise ValueError(f"Radio material ('{self.name}') already used by"
                              " another scene.")
         self._scene = weakref.ref(scene)
+
+    def _detach_from_scene(self) -> None:
+        r"""
+        Clears the reference to the scene to which this material belonged
+
+        This is called when the material is removed from a scene, so that it
+        can subsequently be used by another one.
+        """
+        self._scene = lambda: None
 
     @property
     def name(self):
@@ -108,23 +115,16 @@ class RadioMaterialBase(mi.BSDF):
         (read-only) Return `True` if at least one object in the scene
         uses this material
 
+        This is evaluated from the objects currently in the scene, and
+        therefore only accounts for objects that are part of it: an object that
+        was removed from the scene no longer uses its material.
+
         :type: :py:class:`bool`
         """
-        return self._count_using_objects > 0
-
-    def add_object(self):
-        r"""
-        Increment the counter indicating the number of objects using this
-        material
-        """
-        self._count_using_objects += 1
-
-    def remove_object(self):
-        r"""
-        Decreases the counter indicating the number of objects using this
-        material
-        """
-        self._count_using_objects -= 1
+        scene = self.scene
+        if scene is None:
+            return False
+        return any(o.radio_material is self for o in scene.objects.values())
 
     # pylint: disable=unused-argument
     def sample(

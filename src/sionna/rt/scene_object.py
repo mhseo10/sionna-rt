@@ -12,6 +12,7 @@ import weakref
 import drjit as dr
 import mitsuba as mi
 import os
+from typing import Callable
 from .utils import look_at_orientation, rotation_matrix
 from .utils.meshes import clone_mesh, load_mesh, remove_mesh_duplicate_vertices, build_mesh_directed_edges
 from .radio_materials import RadioMaterialBase
@@ -49,6 +50,21 @@ class SceneObject:
                                                         itu_type="metal",
                                                         thickness=0.01))
 
+    The position and orientation of an object can be set at construction, or
+    through the :attr:`~sionna.rt.SceneObject.position` and
+    :attr:`~sionna.rt.SceneObject.orientation` properties:
+
+    .. code-block:: python
+
+        obj = SceneObject(fname=sionna.rt.scene.sphere,
+                          name="sphere",
+                          radio_material=ITURadioMaterial(name="sphere-material",
+                                                          itu_type="metal",
+                                                          thickness=0.01),
+                          position=mi.Point3f(10, 0, 5))
+        obj.orientation = mi.Point3f(dr.pi/2, 0, 0)
+        scene.add(obj)
+
     :param mi_mesh: Mitsuba shape.
         Must be provided if ``fname`` is :py:class:`None`.
 
@@ -60,6 +76,27 @@ class SceneObject:
 
     :param radio_material: Radio material of the object.
         Must be provided if ``fname`` is not :py:class:`None`.
+
+    :param remove_duplicate_vertices: If set to `True`, duplicate vertices are
+        removed from the mesh.
+
+    :param position: Position :math:`(x,y,z)` [m] of the center of the object.
+        If set to :py:class:`None`, the object keeps the position of its mesh.
+
+    :param orientation: Orientation specified through three angles
+        :math:`(\alpha, \beta, \gamma)`
+        corresponding to a 3D rotation as defined in :eq:`rotation`.
+        Mutually exclusive with ``look_at``; specifying both raises
+        :py:class:`ValueError`. Defaults to :math:`(0,0,0)` if both
+        ``orientation`` and ``look_at`` are :py:class:`None`.
+
+    :param look_at: A position, or the instance of a
+        :class:`~sionna.rt.SceneObject` or :class:`~sionna.rt.RadioDevice` to
+        look at. Mutually exclusive with ``orientation``. Targets cannot be
+        specified by name here, as the object does not belong to a scene yet;
+        use :meth:`~sionna.rt.SceneObject.look_at` for that.
+
+    :param velocity: Velocity vector of the object [m/s]
     """
     # Counter to handle objects with no name
     NO_NAME_COUNTER = 0
@@ -69,7 +106,20 @@ class SceneObject:
                  name: str | None=None,
                  fname: str | None=None,
                  radio_material: RadioMaterialBase | None=None,
-                 remove_duplicate_vertices: bool = False):
+                 remove_duplicate_vertices: bool = False,
+                 position: mi.Point3f | None = None,
+                 orientation: mi.Point3f | None = None,
+                 look_at: (mi.Point3f | SceneObject | RadioDevice |
+                           None) = None,
+                 velocity: mi.Vector3f | None = None):
+
+        if (orientation is not None) and (look_at is not None):
+            raise ValueError("Only one of `orientation` or `look_at` can be "
+                             "specified.")
+        if isinstance(look_at, str):
+            raise ValueError("A target can only be specified by name once the"
+                             " object has been added to a scene."
+                             " Use `SceneObject.look_at()` instead.")
 
         if mi_mesh is not None:
             if not isinstance(mi_mesh, mi.Mesh):
@@ -134,24 +184,38 @@ class SceneObject:
         self._object_id = dr.reinterpret_array(mi.UInt32,
                                                mi.ShapePtr(mi_mesh))[0]
 
-        # Increment the material counter of objects
-        self.radio_material.add_object()
-
-        # Set initial position and orientation of the object
-        self._position = mi.Point3f(0, 0, 0)
+        # Set initial orientation and scaling of the object.
+        # The position is not stored, as it is derived from the geometry.
         self._orientation = mi.Point3f(0, 0, 0)
         self._scaling = mi.Vector3f(1.0)
+
+        # Bounding box of the mesh in the local coordinate system (LCS) of the
+        # object, i.e., as read before the pose below is applied.
+        self._lcs_bbox = mi_mesh.bbox()
 
         # The object storing the velocity is only created when the user sets
         # a nonzero value. This is possible because evaluating a shape
         # attribute returns `0.f` by default when the attribute does not exist.
         self._velocity_params = None
 
+        # The position must be set first, as the look-at direction
+        # depends on it.
+        if position is not None:
+            self.position = position
+
+        if look_at is not None:
+            self.look_at(look_at)
+        elif orientation is not None:
+            self.orientation = orientation
+
+        if velocity is not None:
+            self.velocity = velocity
+
     @property
     def scene(self):
         """
         Get/set the scene to which the object belongs. Note that the scene can
-        only be set once.
+        only be set once, until the object is removed from that scene.
 
         :type: :py:class:`sionna.rt.Scene`
         """
@@ -226,9 +290,6 @@ class SceneObject:
         else:
             mat_obj = mat
 
-        # Current radio material
-        current_mat = self.radio_material
-
         # Add the radio material to the scene
         if self.scene is not None:
             self.scene.add(mat_obj)
@@ -237,14 +298,9 @@ class SceneObject:
                 raise ValueError("Radio material and object are not part of the"
                                  " same scene")
 
-        # Increment the material counter of objects
-        mat_obj.add_object()
-
-        # Remove the object from the set of the currently used material, if any
-        if isinstance(current_mat, RadioMaterialBase):
-            current_mat.remove_object()
-
-        # Effectively update the radio material of the Mitsuba shape
+        # Effectively update the radio material of the Mitsuba shape.
+        # Whether a material is used is derived from the objects of the scene,
+        # so there is no bookkeeping to do here.
         self._mi_mesh.set_bsdf(mat_obj)
 
     @property
@@ -296,24 +352,8 @@ class SceneObject:
     @position.setter
     def position(self, new_position: mi.Point3f):
 
-        if self.scene is None:
-            raise ValueError("Scene is not set: Object must be added to a"
-                             " scene before setting its position")
-
-        # Scene parameters
-        scene_params = self.scene.mi_scene_params
-
-        # Use the shape id, and not the object name, to access the Mitsuba
-        # scene
-        vp_key = self._mi_mesh.id() + ".vertex_positions"
-
-        current_vertices = dr.unravel(mi.Point3f, scene_params[vp_key])
-        translation_vector = new_position - self.position
-        translated_vertices = current_vertices + translation_vector
-        scene_params[vp_key] = dr.ravel(translated_vertices)
-
-        scene_params.update()
-        self.scene.scene_geometry_updated()
+        translation_vector = mi.Point3f(new_position) - self.position
+        self._transform_vertices(lambda v: v + translation_vector)
 
     @property
     def orientation(self):
@@ -328,10 +368,6 @@ class SceneObject:
     @orientation.setter
     def orientation(self, new_orientation: mi.Point3f):
 
-        if self.scene is None:
-            raise ValueError("Scene is not set: Object must be added to a"
-                             " scene before setting its orientation")
-
         new_orientation = mi.Point3f(new_orientation)
 
         # Build the transformation corresponding to the new rotation
@@ -341,29 +377,20 @@ class SceneObject:
         cur_rotation = rotation_matrix(self.orientation)
         inv_cur_rotation = cur_rotation.T
 
-        # Scene parameters
-        scene_params = self.scene.mi_scene_params
-
-        # Use the shape id, and not the object name, to access the Mitsuba
-        # scene
-        vp_key = self._mi_mesh.id() + ".vertex_positions"
-
         # To rotate the object, we need to:
         # 1. Position such that its center is (0,0,0)
         # 2. Undo the current orientation (if any)
         # 3. Apply the new orientation
         # 4. Reposition the object to its current position
-
-        current_vertices = dr.unravel(mi.Point3f, scene_params[vp_key])
         position = self.position
-        rotated_vertices = current_vertices - position
-        rotated_vertices = new_rotation@inv_cur_rotation@rotated_vertices
-        rotated_vertices = rotated_vertices + position
-        scene_params[vp_key] = dr.ravel(rotated_vertices)
-        scene_params.update()
+
+        def rotate(vertices):
+            vertices = vertices - position
+            vertices = new_rotation@inv_cur_rotation@vertices
+            return vertices + position
 
         self._orientation = new_orientation
-        self.scene.scene_geometry_updated()
+        self._transform_vertices(rotate)
 
     @property
     def scaling(self):
@@ -388,42 +415,39 @@ class SceneObject:
         :param new_scaling: The new scaling factor in the objects coordinate
             system. Can be a scalar or a vector value
         """
-        if self.scene is None:
-            raise ValueError("Scene is not set: Object must be added to a"
-                             " scene before setting its scaling")
-
         new_scaling = mi.Vector3f(new_scaling)
 
         if dr.any(new_scaling <= 0.0):
             raise ValueError("Scaling must be positive")
 
-        # Scene parameters
-        scene_params = self.scene.mi_scene_params
-
-        # Use the shape id, and not the object name, to access the Mitsuba
-        # scene
-        vp_key = self._mi_mesh.id() + ".vertex_positions"
-
         # Get the current rotation and its inverse
         cur_rotation = rotation_matrix(self.orientation)
         inv_cur_rotation = cur_rotation.T
 
-        current_vertices = dr.unravel(mi.Point3f, scene_params[vp_key])
+        position = self.position
+        relative_scaling = new_scaling / self._scaling
 
-        current_vertices -= self.position  # Undo the translation
-        rotated_vertices = inv_cur_rotation @ current_vertices  # Undo the rotation
-
-        scaled_vertices = (new_scaling / self._scaling) * rotated_vertices  # Perform the scaling
-
-        scaled_vertices = cur_rotation @ scaled_vertices  # Redo the rotation
-        scaled_vertices += self.position  # Redo the translation
-
-        scene_params[vp_key] = dr.ravel(scaled_vertices)
+        def scale(vertices):
+            vertices = vertices - position  # Undo the translation
+            vertices = inv_cur_rotation @ vertices  # Undo the rotation
+            vertices = relative_scaling * vertices  # Perform the scaling
+            vertices = cur_rotation @ vertices  # Redo the rotation
+            return vertices + position  # Redo the translation
 
         self._scaling = new_scaling
+        self._transform_vertices(scale)
 
-        scene_params.update()
-        self.scene.scene_geometry_updated()
+    @property
+    def lcs_half_extents(self):
+        r"""(read-only) Half extents [m] of the bounding box of the object in
+        its local coordinate system (LCS), i.e., of the box which is centered
+        on its :attr:`~sionna.rt.SceneObject.position` and oriented according
+        to its :attr:`~sionna.rt.SceneObject.orientation`
+
+        :type: :py:class:`mi.Vector3f`
+        """
+        extents = mi.Vector3f(self._lcs_bbox.max - self._lcs_bbox.min)
+        return 0.5*extents*self._scaling
 
     def look_at(self, target: mi.Point3f | SceneObject | RadioDevice | str):
         # pylint: disable=line-too-long
@@ -491,4 +515,74 @@ class SceneObject:
         if as_mesh:
             return cloned_mesh
         else:
-            return SceneObject(name=cloned_mesh.id(), mi_mesh=cloned_mesh)
+            clone = SceneObject(name=cloned_mesh.id(), mi_mesh=cloned_mesh)
+            self._carry_over_pose(clone)
+            return clone
+
+    ##################################################
+    # Internal methods
+    ##################################################
+
+    def _detach_from_scene(self) -> None:
+        r"""
+        Clears the reference to the scene to which this object belonged
+
+        This is called when the object is removed from a scene. The object then
+        behaves as one that was never added to a scene: its geometry is
+        transformed directly on its Mitsuba shape, and it can be added to a
+        scene again.
+        """
+        self._scene = lambda: None
+
+    def _carry_over_pose(self, other: SceneObject) -> None:
+        r"""
+        Carries over to ``other`` the pose of this object that is not already
+        encoded in its mesh
+
+        The position of an object is entirely determined by its mesh, and is
+        therefore shared by any object built from a copy of that mesh. The
+        orientation, scaling, velocity, and bounding box in the local
+        coordinate system, however, are tracked separately and must be copied
+        explicitly. The latter must be carried over as the mesh of ``other``
+        was copied from an already posed mesh, and reading its box therefore
+        does not give the box of the local coordinate system.
+
+        :param other: Object built from a copy of the mesh of this object
+        """
+        # pylint: disable=protected-access
+        other._orientation = mi.Point3f(self._orientation)
+        other._scaling = mi.Vector3f(self._scaling)
+        other._lcs_bbox = mi.ScalarBoundingBox3f(self._lcs_bbox)
+        if self._velocity_params is not None:
+            other.velocity = self.velocity
+
+    def _transform_vertices(self,
+                            transform: Callable[[mi.Point3f], mi.Point3f]
+                            ) -> None:
+        r"""
+        Applies ``transform`` to the vertex positions of the object
+
+        If the object belongs to a scene, the vertices are updated through the
+        scene parameters, so that the scene is notified of the change.
+        Otherwise, they are updated directly on the Mitsuba shape. This allows
+        transforming an object before it is added to a scene.
+
+        :param transform: Callable mapping the current vertex positions to the
+            new ones
+        """
+        scene = self.scene
+        if scene is None:
+            params = mi.traverse(self._mi_mesh)
+            vp_key = "vertex_positions"
+        else:
+            params = scene.mi_scene_params
+            # Use the shape id, and not the object name, to access the Mitsuba
+            # scene
+            vp_key = self._mi_mesh.id() + ".vertex_positions"
+
+        vertices = dr.unravel(mi.Point3f, params[vp_key])
+        params[vp_key] = dr.ravel(transform(vertices))
+        params.update()
+
+        if scene is not None:
+            scene.scene_geometry_updated()

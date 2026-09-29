@@ -6,9 +6,9 @@
 
 import drjit as dr
 import mitsuba as mi
-from typing import Tuple
-from sionna.rt.constants import EPSILON_FLOAT
+from typing import List, Tuple
 from sionna.rt.utils.misc import safe_atan2, isclose
+from sionna.rt.constants import EPSILON_FLOAT
 
 
 def phi_hat(phi: mi.Float) -> mi.Vector3f:
@@ -258,3 +258,26 @@ def point_plane_reflection(p: mi.Point3f,
                         p - 2 * dr.dot(p - v, n) * n,
                         p)
     return p_prime
+
+def concat_points(points: List[mi.Point3f]) -> mi.Point3f:
+    r"""
+    Concatenates arrays of points into a single array
+
+    Empty arrays, i.e., arrays of zero width, are skipped, as concatenating
+    them would insert a dummy point at the origin. An empty array is returned
+    if all the arrays are empty.
+
+    :param points: Arrays of points to concatenate, in the order in which they
+        should appear in the returned array
+
+    :return: Concatenated points
+    """
+
+    points = [p for p in points if dr.width(p) > 0]
+    if len(points) == 0:
+        return mi.Point3f()
+    if len(points) == 1:
+        return points[0]
+    return mi.Point3f(dr.concat([p.x for p in points]),
+                      dr.concat([p.y for p in points]),
+                      dr.concat([p.z for p in points]))

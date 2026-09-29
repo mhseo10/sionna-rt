@@ -14,7 +14,8 @@ from sionna.rt import RadioMaterial
 from sionna.rt.utils import jones_matrix_rotator, to_world_jones_rotator,\
     jones_vec_dot, implicit_basis_vector, jones_matrix_rotator_flip_forward,\
     transverse_basis_from_normal, jones_matrix_to_world_implicit,\
-    complex_relative_permittivity, itu_coefficients_single_layer_slab
+    complex_relative_permittivity, itu_coefficients_single_layer_slab,\
+    jones_matrix_from_real_imag
 
 #############################################################
 # Constants
@@ -412,6 +413,36 @@ def test_jones_matrix_to_world_implicit(ki_local, reflection, rotated):
     out_c = out_real[:, :2] + 1j * out_real[:, 2:]
     out_c_ref = batch_matvec(J_ref, e_c)
     assert max_rel_se(out_c_ref, out_c) < MAX_RSE
+
+
+def test_jones_matrix_from_real_imag():
+    r"""Test `jones_matrix_from_real_imag()` against numpy"""
+
+    np.random.seed(42)
+    batch_size = 100
+
+    J_ref = (np.random.normal(size=(batch_size, 2, 2))
+             + 1j * np.random.normal(size=(batch_size, 2, 2)))
+
+    def mat2(a):
+        return mi.Matrix2f(a[:,0,0], a[:,0,1], a[:,1,0], a[:,1,1])
+
+    M = jones_matrix_from_real_imag(mat2(J_ref.real), mat2(J_ref.imag))
+
+    M_np = mat4_mi_to_np(M)
+    M_ref = np.stack([embed_complex_jones(J) for J in J_ref], axis=0)
+    assert max_rel_se(M_ref, M_np) < MAX_RSE
+
+    # Applying the returned matrix to a Jones vector must match J @ e
+    e_c = (np.random.normal(size=(batch_size, 2))
+           + 1j * np.random.normal(size=(batch_size, 2)))
+    e_mi = mi.Vector4f(e_c.real[:,0], e_c.real[:,1],
+                       e_c.imag[:,0], e_c.imag[:,1])
+
+    out = (M @ e_mi).numpy().T
+
+    out_c = out[:, :2] + 1j * out[:, 2:]
+    assert max_rel_se(batch_matvec(J_ref, e_c), out_c) < MAX_RSE
 
 
 def test_jones_matrix_to_world_implicit_identity_and_zero_coeffs():

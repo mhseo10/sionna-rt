@@ -6,7 +6,7 @@
 
 import mitsuba as mi
 import drjit as dr
-from typing import Union, Type, Tuple
+from typing import List, Union, Type, Tuple
 import dataclasses
 
 from sionna.rt.constants import InteractionType, INVALID_SHAPE,\
@@ -128,6 +128,9 @@ class PathsBufferBase:
         r"""Intersected shapes. Invalid shapes are represented by
         :data:`~sionna.rt.constants.INVALID_SHAPE`
 
+        For :data:`~sionna.rt.constants.InteractionType.SENSING` interactions,
+        the index of the sensing target is stored instead of a shape.
+
         :type: :py:class:`mi.TensorXu [buffer_size, depth_dim_size]`
         """
         return self._shapes
@@ -136,6 +139,10 @@ class PathsBufferBase:
     def primitives(self):
         r"""Intersected primitives. Invalid primitives are represented by
         :data:`~sionna.rt.constants.INVALID_PRIMITIVE`.
+
+        For :data:`~sionna.rt.constants.InteractionType.SENSING` interactions,
+        the index, within its sensing target, of the sensing point is stored
+        instead of a primitive.
 
         :type: :py:class:`mi.TensorXu [buffer_size, depth_dim_size]`
         """
@@ -736,6 +743,335 @@ class PathsBuffer(PathsBufferBase):
         self._tensor_width_lit = dr.width(self._shapes.array)
         self._tensor_width = dr.opaque(mi.UInt32, self._tensor_width_lit)
 
+    def gather(self, indices: mi.UInt) -> "PathsBuffer":
+        # pylint: disable=protected-access
+        r"""
+        Extracts the paths with indices ``indices`` into a new paths buffer
+
+        The returned buffer has a size equal to the number of items in
+        ``indices``, and its :attr:`~sionna.rt.PathsBuffer.paths_counter` is set
+        to this value. Paths can be selected multiple times, and the order of
+        ``indices`` is preserved.
+
+        The channel impulse response coefficients
+        (:attr:`~sionna.rt.PathsBuffer.a`), delays
+        (:attr:`~sionna.rt.PathsBuffer.tau`), and Doppler shifts
+        (:attr:`~sionna.rt.PathsBuffer.doppler`) are only extracted if they were
+        computed, i.e., if they are not `None`.
+
+        :param indices: Indices of the paths to extract. Must be in
+            `[0, buffer_size)`.
+
+        :return: New buffer storing the selected paths
+        """
+
+        depth_dim_size = self._depth_dim_size
+        self.schedule()
+
+        # Number of extracted paths
+        num_paths = dr.width(indices)
+
+        # Tensor indices for gathering the paths data
+        depth_ind = dr.tile(dr.arange(mi.UInt, 0, depth_dim_size), num_paths)
+        # Need to handle the case where no path is extracted separately
+        if num_paths == 0:
+            tensor_gind = []
+        else:
+            tensor_gind = dr.repeat(indices, depth_dim_size)*depth_dim_size\
+                            + depth_ind
+
+        other = PathsBuffer(num_paths, self._max_depth, self._diffraction)
+
+        other._valid = dr.gather(mi.Bool, self._valid, indices)
+        other._src_indices = dr.gather(mi.UInt, self._src_indices, indices)
+        other._tgt_indices = dr.gather(mi.UInt, self._tgt_indices, indices)
+        if self._a is not None:
+            a = []
+            for a_ in self._a:
+                a1 = []
+                for a__ in a_:
+                    a1.append(dr.gather(mi.Complex2f, a__, indices))
+                a.append(a1)
+            other._a = a
+        if self._tau is not None:
+            other._tau = dr.gather(mi.Float, self._tau, indices)
+        if self._doppler is not None:
+            other._doppler = dr.gather(mi.Float, self._doppler, indices)
+        other._k_tx_x = dr.gather(mi.Float, self._k_tx_x, indices)
+        other._k_tx_y = dr.gather(mi.Float, self._k_tx_y, indices)
+        other._k_tx_z = dr.gather(mi.Float, self._k_tx_z, indices)
+        other._k_rx_x = dr.gather(mi.Float, self._k_rx_x, indices)
+        other._k_rx_y = dr.gather(mi.Float, self._k_rx_y, indices)
+        other._k_rx_z = dr.gather(mi.Float, self._k_rx_z, indices)
+        other._interaction_types = mi.TensorXu(
+            dr.gather(mi.UInt, self._interaction_types.array, tensor_gind),
+            shape=(num_paths, depth_dim_size)
+        )
+        other._vertices_x = mi.TensorXf(
+            dr.gather(mi.Float, self._vertices_x.array, tensor_gind),
+            shape=(num_paths, depth_dim_size)
+        )
+        other._vertices_y = mi.TensorXf(
+            dr.gather(mi.Float, self._vertices_y.array, tensor_gind),
+            shape=(num_paths, depth_dim_size)
+        )
+        other._vertices_z = mi.TensorXf(
+            dr.gather(mi.Float, self._vertices_z.array, tensor_gind),
+            shape=(num_paths, depth_dim_size)
+        )
+        other._shapes = mi.TensorXu(
+            dr.gather(mi.UInt, self._shapes.array, tensor_gind),
+            shape=(num_paths, depth_dim_size)
+        )
+        other._primitives = mi.TensorXu(
+            dr.gather(mi.UInt, self._primitives.array, tensor_gind),
+            shape=(num_paths, depth_dim_size)
+        )
+        if self._diffraction:
+            other._diffracting_wedges = dr.gather(
+                WedgeGeometry,
+                self._diffracting_wedges,
+                indices
+            )
+        other._probs = mi.TensorXf(
+            dr.gather(mi.Float, self._probs.array, tensor_gind),
+            shape=(num_paths, depth_dim_size)
+        )
+
+        other._paths_counter = mi.UInt(num_paths)
+
+        return other
+
+    def tile(self, count: int) -> "PathsBuffer":
+        r"""
+        Repeats the content of the buffer ``count`` times into a new paths
+        buffer, similarly to :func:`drjit.tile`
+
+        The paths of the returned buffer, which has a size equal to
+        `buffer_size*count`, are ordered as
+        :math:`(p_0, \dots, p_{N-1}, p_0, \dots, p_{N-1}, \dots)`, where
+        :math:`p_i` denotes the :math:`i` th path of this buffer and :math:`N`
+        its size.
+
+        As with :meth:`~sionna.rt.PathsBuffer.gather`, the channel impulse
+        response coefficients (:attr:`~sionna.rt.PathsBuffer.a`), delays
+        (:attr:`~sionna.rt.PathsBuffer.tau`), and Doppler shifts
+        (:attr:`~sionna.rt.PathsBuffer.doppler`) are only copied if they were
+        computed, i.e., if they are not `None`.
+
+        :param count: Number of repetitions
+
+        :return: New buffer storing the tiled paths
+        """
+
+        indices = dr.tile(dr.arange(mi.UInt, self._buffer_size), count)
+        return self.gather(indices)
+
+    def repeat(self, count: int) -> "PathsBuffer":
+        r"""
+        Repeats every path of the buffer ``count`` times into a new paths
+        buffer, similarly to :func:`drjit.repeat`
+
+        The paths of the returned buffer, which has a size equal to
+        `buffer_size*count`, are ordered as
+        :math:`(p_0, \dots, p_0, p_1, \dots, p_1, \dots)`, where :math:`p_i`
+        denotes the :math:`i` th path of this buffer.
+
+        As with :meth:`~sionna.rt.PathsBuffer.gather`, the channel impulse
+        response coefficients (:attr:`~sionna.rt.PathsBuffer.a`), delays
+        (:attr:`~sionna.rt.PathsBuffer.tau`), and Doppler shifts
+        (:attr:`~sionna.rt.PathsBuffer.doppler`) are only copied if they were
+        computed, i.e., if they are not `None`.
+
+        :param count: Number of repetitions
+
+        :return: New buffer storing the repeated paths
+        """
+
+        indices = dr.repeat(dr.arange(mi.UInt, self._buffer_size), count)
+        return self.gather(indices)
+
+    def reverse(self) -> "PathsBuffer":
+        # pylint: disable=protected-access, line-too-long
+        r"""
+        Reverses the direction of the paths
+
+        A path connecting a source :math:`a` to a target :math:`b` through the
+        vertices :math:`v_1, \dots, v_D`, i.e.,
+        :math:`a \rightarrow v_1 \rightarrow \dots \rightarrow v_D \rightarrow b`,
+        becomes
+        :math:`b \rightarrow v_D \rightarrow \dots \rightarrow v_1 \rightarrow a`.
+
+        To that end, the indices of the sources and targets are swapped, as
+        well as the directions of departure and arrival, which both point
+        from the corresponding radio device towards the adjacent path vertex.
+        The data stored for every interaction, i.e., the vertices, interaction
+        types, shapes, primitives, and probabilities, is reversed along the
+        depth dimension.
+
+        The channel coefficients (:attr:`~sionna.rt.PathsBuffer.a`), delays
+        (:attr:`~sionna.rt.PathsBuffer.tau`), and Doppler shifts
+        (:attr:`~sionna.rt.PathsBuffer.doppler`) are left unchanged. The
+        diffracting wedges (:attr:`~sionna.rt.PathsBuffer.diffracting_wedges`)
+        are left unchanged as well, as they describe the same wedges. Note
+        however that the faces of these wedges are ordered according to the
+        original direction of propagation, i.e., the 0-face is the one
+        illuminated by the original source.
+
+        This buffer is left unchanged.
+
+        :return: New buffer storing the reversed paths
+        """
+
+        other = self.gather(dr.arange(mi.UInt, self._buffer_size))
+        other._paths_counter = mi.UInt(self._paths_counter)
+
+        if self._buffer_size == 0:
+            return other
+
+        depth_dim_size = self._depth_dim_size
+
+        # Swap the sources and the targets
+        other._src_indices, other._tgt_indices = self._tgt_indices,\
+                                                 self._src_indices
+
+        # Swap the directions of departure and arrival
+        other._k_tx_x, other._k_rx_x = self._k_rx_x, self._k_tx_x
+        other._k_tx_y, other._k_rx_y = self._k_rx_y, self._k_tx_y
+        other._k_tx_z, other._k_rx_z = self._k_rx_z, self._k_tx_z
+
+        # Items of the tensors storing the interactions data that correspond to
+        # an interaction. The interactions of a path are stored contiguously
+        # starting from a depth of one, and the remaining entries are set to
+        # `InteractionType.NONE`.
+        is_interaction = self._interaction_types.array != InteractionType.NONE
+
+        # Number of interactions of every path
+        num_interactions = self.num_interactions()
+
+        # For every item of the tensors storing the interactions data, index of
+        # the item it should read from, i.e., of the symmetric item with respect
+        # to the middle of the path.
+        # Items that do not correspond to an interaction read themselves, and
+        # are therefore left unchanged.
+        ind = dr.arange(mi.UInt, self._buffer_size*depth_dim_size)
+        path_ind = ind // depth_dim_size
+        depth_ind = ind - path_ind*depth_dim_size
+        path_num_interactions = dr.gather(mi.UInt, num_interactions, path_ind)
+        rev_ind = path_ind*depth_dim_size \
+                  + dr.select(is_interaction,
+                              path_num_interactions - depth_ind - 1, depth_ind)
+
+        other._interaction_types = self._reverse_depth(
+            mi.UInt, self._interaction_types, rev_ind)
+        other._vertices_x = self._reverse_depth(mi.Float, self._vertices_x,
+                                                rev_ind)
+        other._vertices_y = self._reverse_depth(mi.Float, self._vertices_y,
+                                                rev_ind)
+        other._vertices_z = self._reverse_depth(mi.Float, self._vertices_z,
+                                                rev_ind)
+        other._shapes = self._reverse_depth(mi.UInt, self._shapes, rev_ind)
+        other._primitives = self._reverse_depth(mi.UInt, self._primitives,
+                                                rev_ind)
+        other._probs = self._reverse_depth(mi.Float, self._probs, rev_ind)
+
+        return other
+
+    def chain(self,
+              others: List["PathsBuffer"],
+              max_depth: int | None = None) -> "PathsBuffer":
+        # pylint: disable=protected-access, line-too-long
+        r"""
+        Chains the paths of this buffer with the paths of ``others`` into a new
+        paths buffer
+
+        The buffers are chained in the order in which they are given, i.e.,
+        this buffer followed by ``others[0]``, ``others[1]``, and so on. Every
+        buffer must store the same number of paths, and the :math:`i` th path of
+        the returned buffer is the concatenation of the :math:`i` th path of
+        every buffer of the chain. Its
+        :attr:`~sionna.rt.PathsBuffer.max_depth` defaults to the sum of the
+        maximum depths of the chained buffers, which always fits the chained
+        paths.
+
+        The chained paths originate from the sources of this buffer and connect
+        to the targets of the last buffer of the chain. Accordingly, the
+        directions of departure are read from this buffer and the directions of
+        arrival from the last one. A chained path is flagged as valid only if
+        the corresponding path of every buffer of the chain is valid.
+
+        The data stored for every interaction, i.e., the vertices, interaction
+        types, shapes, primitives, and probabilities, is concatenated along the
+        depth dimension. Note that the endpoints shared by two consecutive
+        buffers of the chain, i.e., the target of a buffer and the source of the
+        next one, are not added as interactions. If they should be recorded as
+        such, they must be added to the corresponding buffer beforehand. The
+        sensing targets and sensing points of
+        :data:`~sionna.rt.constants.InteractionType.SENSING` interactions are
+        therefore preserved, as they are stored by the shapes and primitives.
+
+        The channel impulse response coefficients
+        (:attr:`~sionna.rt.PathsBuffer.a`), delays
+        (:attr:`~sionna.rt.PathsBuffer.tau`), Doppler shifts
+        (:attr:`~sionna.rt.PathsBuffer.doppler`), and diffracting wedges
+        (:attr:`~sionna.rt.PathsBuffer.diffracting_wedges`) of the chained
+        buffers are dropped, as they describe individual segments of the chained
+        paths. They must therefore be set for the returned buffer by the caller.
+
+        This buffer and the buffers of ``others`` are left unchanged.
+
+        :param others: Paths buffers to chain to this one, in the order in which
+            they are traversed. Must all store as many paths as this buffer.
+        :param max_depth: Maximum depth of the returned buffer. Only the
+            interactions of the chained paths are written, so a depth as small
+            as the largest number of interactions of a chained path is enough.
+            The caller must guarantee this bound, as the interactions of a path
+            that exceeds it would be written over the ones of the next path.
+            Defaults to the sum of the maximum depths of the chained buffers.
+
+        :return: New buffer storing the chained paths
+        """
+
+        num_paths = self._buffer_size
+
+        buffers = [self] + list(others)
+        for buffer in buffers:
+            if buffer.buffer_size != num_paths:
+                raise ValueError("All the chained buffers must store the same"
+                                 " number of paths")
+
+        if max_depth is None:
+            max_depth = sum(buffer.max_depth for buffer in buffers)
+        result = PathsBuffer(num_paths, max_depth, False)
+
+        # The chained paths originate from the sources of this buffer and
+        # connect to the targets of the last buffer of the chain
+        last = buffers[-1]
+        result._valid = dr.copy(self._valid)
+        for buffer in others:
+            result._valid &= buffer.valid
+        result._src_indices = dr.copy(self._src_indices)
+        result._tgt_indices = dr.copy(last.target_indices)
+        result._k_tx_x = dr.copy(self._k_tx_x)
+        result._k_tx_y = dr.copy(self._k_tx_y)
+        result._k_tx_z = dr.copy(self._k_tx_z)
+        result._k_rx_x = dr.copy(last._k_rx_x)
+        result._k_rx_y = dr.copy(last._k_rx_y)
+        result._k_rx_z = dr.copy(last._k_rx_z)
+        result._paths_counter = mi.UInt(num_paths)
+
+        if num_paths == 0:
+            return result
+
+        # Every buffer writes its interactions after those of the buffers that
+        # precede it in the chain
+        offsets = dr.zeros(mi.UInt, num_paths)
+        for buffer in buffers:
+            buffer._scatter_interactions(result, offsets)
+            offsets += buffer.num_interactions()
+
+        return result
+
     def get_interaction_type(self,
                              depth: mi.UInt,
                              active: mi.Bool) -> mi.UInt:
@@ -885,9 +1221,83 @@ class PathsBuffer(PathsBufferBase):
         if self._diffraction:
             self._diffracting_wedges = dr.detach(self._diffracting_wedges)
 
+    def num_interactions(self) -> mi.UInt:
+        r"""
+        Computes the number of interactions of every path
+
+        The interactions of a path are stored contiguously starting from a
+        depth of one, and the remaining entries are set to
+        :data:`~sionna.rt.constants.InteractionType.NONE`.
+
+        :return: Number of interactions of every path
+        """
+
+        is_interaction = self._interaction_types.array != InteractionType.NONE
+        return dr.block_sum(dr.select(is_interaction, mi.UInt(1), mi.UInt(0)),
+                            self._depth_dim_size)
+
     ###############################################
     # Internal methods
     ###############################################
+
+    def _scatter_interactions(self,
+                              dst: "PathsBuffer",
+                              offsets: mi.UInt) -> None:
+        # pylint: disable=protected-access
+        r"""
+        Scatters the data stored for every interaction of the paths, i.e., the
+        vertices, interaction types, shapes, primitives, and probabilities,
+        into ``dst``, shifting the depth of every path by ``offsets``
+
+        ``dst`` must store as many paths as this buffer, and its depth
+        dimension must be large enough to accomodate the shifted interactions.
+
+        :param dst: Buffer to scatter the interactions data into
+        :param offsets: For every path, depth offset at which its interactions
+            are written
+        """
+
+        depth_dim_size = self._depth_dim_size
+
+        is_interaction = self._interaction_types.array != InteractionType.NONE
+
+        ind = dr.arange(mi.UInt, self._buffer_size*depth_dim_size)
+        path_ind = ind // depth_dim_size
+        depth_ind = ind - path_ind*depth_dim_size
+        dst_ind = path_ind*dst.depth_dim_size + depth_ind \
+                  + dr.gather(mi.UInt, offsets, path_ind)
+
+        for dst_tensor, src_tensor in (
+                (dst._interaction_types, self._interaction_types),
+                (dst._vertices_x, self._vertices_x),
+                (dst._vertices_y, self._vertices_y),
+                (dst._vertices_z, self._vertices_z),
+                (dst._shapes, self._shapes),
+                (dst._primitives, self._primitives),
+                (dst._probs, self._probs)):
+            dr.scatter(dst_tensor.array, src_tensor.array, dst_ind,
+                       is_interaction)
+
+    def _reverse_depth(self,
+                       dtype: Type[Union[mi.Float, mi.UInt, mi.Bool]],
+                       tensor: mi.TensorXf | mi.TensorXu | mi.TensorXb,
+                       indices: mi.UInt
+        ) -> mi.TensorXf | mi.TensorXu | mi.TensorXb:
+        r"""
+        Reorders the items of ``tensor`` according to ``indices``
+
+        ``tensor`` is assumed to have shape `[buffer_size, depth_dim_size]`.
+
+        :param dtype: Mitsuba type of the items of ``tensor``
+        :param tensor: Tensor to reorder
+        :param indices: For every item of the flattened ``tensor``, index of the
+            item to read from
+
+        :return: Reordered tensor
+        """
+
+        return type(tensor)(dr.gather(dtype, tensor.array, indices),
+                            shape=(self._buffer_size, self._depth_dim_size))
 
     @staticmethod
     def _scatter_k(k_x: mi.Float,

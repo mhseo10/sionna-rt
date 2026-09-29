@@ -12,7 +12,8 @@ from sionna.rt.utils import itu_coefficients_single_layer_slab,\
     complex_relative_permittivity, jones_matrix_to_world_implicit,\
         cot_times_f_utd, jones_matrix_rotator, implicit_basis_vector,\
         transverse_basis_from_normal, wedge_interior_angle,\
-        sample_keller_cone, theta_hat, theta_phi_from_unit_vec
+        jones_matrix_from_real_imag, sample_keller_cone, theta_hat,\
+            theta_phi_from_unit_vec
 from sionna.rt.constants import InteractionType, DEFAULT_THICKNESS,\
     DEFAULT_FREQUENCY, NO_JONES_MATRIX
 from .radio_material_base import RadioMaterialBase
@@ -1188,12 +1189,7 @@ class RadioMaterial(RadioMaterialBase):
         imag = w_out @ imag @ w_in
 
         # Jones matrix is returned as a 4x4 real-valued matrix
-        m4f = mi.Matrix4f(real[0,0], real[0,1], -imag[0,0], -imag[0,1],
-                          real[1,0], real[1,1], -imag[1,0], -imag[1,1],
-                          imag[0,0], imag[0,1],  real[0,0],  real[0,1],
-                          imag[1,0], imag[1,1],  real[1,0],  real[1,1])
-
-        return m4f
+        return jones_matrix_from_real_imag(real, imag)
 
     def _xpd_matrix(self) -> mi.Matrix2f:
         # pylint: disable=line-too-long

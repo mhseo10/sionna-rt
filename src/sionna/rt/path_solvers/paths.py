@@ -4,10 +4,12 @@
 #
 """Stores the computed propagation paths"""
 
+import copy
+
 import mitsuba as mi
 import drjit as dr
 
-from typing import Literal
+from typing import Literal, Self
 
 from .paths_buffer import PathsBuffer
 from sionna.rt.constants import InteractionType, INVALID_SHAPE,\
@@ -291,6 +293,9 @@ class Paths:
         IDs of the intersected objects. Invalid objects are represented by
         :data:`~sionna.rt.constants.INVALID_SHAPE`.
 
+        For :data:`~sionna.rt.constants.InteractionType.SENSING` interactions,
+        the index of the sensing target is stored instead of an object ID.
+
         :type: ``mi.TensorXu [max_depth, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths] or [max_depth, num_rx, num_tx, num_paths]``
         """
         if not self._paths_components_built:
@@ -303,6 +308,10 @@ class Paths:
         """
         Indices of the intersected primitives. Invalid primitives are
         represented by :data:`~sionna.rt.constants.INVALID_PRIMITIVE`.
+
+        For :data:`~sionna.rt.constants.InteractionType.SENSING` interactions,
+        the index, within its sensing target, of the sensing point is stored
+        instead of a primitive index.
 
         :type: ``mi.TensorXu [max_depth, num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths] or [max_depth, num_rx, num_tx, num_paths]``
         """
@@ -374,6 +383,103 @@ class Paths:
         :type: ``mi.TensorXf [num_rx, num_rx_ant, num_tx, num_tx_ant, num_paths] or [num_rx, num_tx, num_paths]``
         """
         return self._doppler
+
+    def concat(self, others: list[Self] | Self) -> Self:
+        # pylint: disable=protected-access
+        r"""
+        Returns a new object containing these paths followed by ``others``
+
+        Paths are appended along the path dimension in the order in which they
+        are given. If their depth dimensions differ, path components are padded
+        to the largest depth. This object and the objects in ``others`` are
+        left unchanged.
+
+        All paths must have been computed for the same scene configuration,
+        endpoints, velocities, and synthetic-array setting.
+
+        :param others: Paths to append, in order
+        :return: Concatenated paths
+        """
+        if isinstance(others, Paths):
+            others = [others]
+        elif not isinstance(others, list) \
+                or any(not isinstance(other, Paths) for other in others):
+            raise ValueError("`others` must be a list of Paths instances")
+
+        paths = [self] + others
+        for other in others:
+            self._check_concat_compatible(other)
+
+        # The public accessors build the components lazily. Reading them from
+        # a shallow copy leaves the operands' internal state unchanged.
+        components = []
+        for paths_ in paths:
+            view = copy.copy(paths_)
+            components.append((view.interactions, view.objects,
+                               view.primitives, view.vertices))
+
+        reference_component_shapes = (
+            components[0][0].shape[1:-1],
+            components[0][1].shape[1:-1],
+            components[0][2].shape[1:-1],
+            components[0][3].shape[1:-2],
+        )
+        for component in components[1:]:
+            component_shapes = (
+                component[0].shape[1:-1],
+                component[1].shape[1:-1],
+                component[2].shape[1:-1],
+                component[3].shape[1:-2],
+            )
+            if component_shapes != reference_component_shapes:
+                raise ValueError("All Paths components must have matching "
+                                 "non-depth and non-path dimensions")
+
+        result = copy.copy(self)
+
+        # Copy mutable metadata arrays so the returned object is detached even
+        # when no additional paths are provided.
+        result._src_positions = dr.copy(self._src_positions)
+        result._tgt_positions = dr.copy(self._tgt_positions)
+        result._tx_velocities = dr.copy(self._tx_velocities)
+        result._rx_velocities = dr.copy(self._rx_velocities)
+
+        for name in (
+            "_valid",
+            "_a_real",
+            "_a_imag",
+            "_tau",
+            "_theta_t",
+            "_phi_t",
+            "_theta_r",
+            "_phi_r",
+            "_doppler",
+        ):
+            tensors = [getattr(paths_, name) for paths_ in paths]
+            setattr(result, name, self._concat_tensors(tensors, axis=-1))
+
+        max_depth = max(component[0].shape[0] for component in components)
+        component_specs = (
+            (0, "_interactions", InteractionType.NONE, -1),
+            (1, "_shapes", INVALID_SHAPE, -1),
+            (2, "_primitives", INVALID_PRIMITIVE, -1),
+            (3, "_vertices", 0., -2),
+        )
+        for index, name, padding_value, path_axis in component_specs:
+            tensors = [
+                self._pad_depth(component[index], max_depth, padding_value)
+                for component in components
+            ]
+            setattr(result, name,
+                    self._concat_tensors(tensors, axis=path_axis))
+
+        result._max_num_paths = sum(paths_.valid.shape[-1]
+                                    for paths_ in paths)
+        result._paths_components_built = True
+        # The result is fully materialized and must not lazily rebuild its
+        # components from one of the operands' buffers.
+        result._paths_buffer = None
+        return result
 
     def cir(self, *,
         sampling_frequency: float = 1.,
@@ -764,6 +870,80 @@ class Paths:
     ###########################################
     # Internal methods
     ###########################################
+
+    def _check_concat_compatible(self, other: Self) -> None:
+        # pylint: disable=protected-access
+        """Raises an error if ``other`` cannot be concatenated with this one."""
+
+        if self.synthetic_array != other.synthetic_array \
+                or self.num_tx != other.num_tx \
+                or self.num_rx != other.num_rx \
+                or self.tx_array is not other.tx_array \
+                or self.rx_array is not other.rx_array:
+            raise ValueError("All Paths must use the same radio and antenna "
+                             "configuration")
+
+        metadata = (
+            ("sources", self.sources, other.sources),
+            ("targets", self.targets, other.targets),
+            ("transmitter velocities", self._tx_velocities,
+             other._tx_velocities),
+            ("receiver velocities", self._rx_velocities,
+             other._rx_velocities),
+            ("frequency", self._frequency, other._frequency),
+            ("wavelength", self._wavelength, other._wavelength),
+        )
+        for name, value, other_value in metadata:
+            if dr.shape(value) != dr.shape(other_value) \
+                    or not bool(dr.allclose(value, other_value)):
+                raise ValueError(f"All Paths must have the same {name}")
+
+        for name in (
+            "_valid",
+            "_a_real",
+            "_a_imag",
+            "_tau",
+            "_theta_t",
+            "_phi_t",
+            "_theta_r",
+            "_phi_r",
+            "_doppler",
+        ):
+            shape = getattr(self, name).shape[:-1]
+            other_shape = getattr(other, name).shape[:-1]
+            if shape != other_shape:
+                raise ValueError("All Paths tensors must have matching "
+                                 "non-path dimensions")
+
+    @staticmethod
+    def _concat_tensors(tensors: list, axis: int):
+        """Concatenates tensors while handling zero-sized dimensions."""
+
+        non_empty = [tensor for tensor in tensors if tensor.shape[axis] > 0]
+        if not non_empty:
+            shape = list(tensors[0].shape)
+            shape[axis] = 0
+            return dr.zeros(type(tensors[0]), shape)
+        if len(non_empty) == 1:
+            return dr.copy(non_empty[0])
+        return dr.concat(non_empty, axis=axis)
+
+    @staticmethod
+    def _pad_depth(tensor, depth: int, value):
+        """Pads the first tensor dimension to ``depth``."""
+
+        if tensor.shape[0] == depth:
+            return tensor
+        shape = list(tensor.shape)
+        shape[0] = depth - tensor.shape[0]
+        # Dr.Jit cannot concatenate tensors whose flattened storage is empty.
+        # Such tensors contain no path data, so directly allocate their final
+        # padded shape.
+        if dr.width(tensor.array) == 0:
+            shape[0] = depth
+            return dr.full(type(tensor), value, shape)
+        padding = dr.full(type(tensor), value, shape)
+        return dr.concat([tensor, padding], axis=0)
 
     @staticmethod
     def _k_component(k: mi.TensorXf, component: int) -> mi.Float:

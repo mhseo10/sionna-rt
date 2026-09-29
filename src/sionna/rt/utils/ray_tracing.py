@@ -7,10 +7,11 @@
 import drjit as dr
 import mitsuba as mi
 from typing import Callable, Tuple
+from dataclasses import dataclass
 
 from sionna.rt.constants import EPSILON_FLOAT
 from sionna.rt.utils.geometry import rotate_vector_around_axis,\
-    theta_phi_from_unit_vec
+    rotation_matrix, theta_phi_from_unit_vec
 from sionna.rt.utils.wedges import wedge_interior_angle
 
 
@@ -167,6 +168,124 @@ def spawn_ray_to(
     ray.time = dr.zeros(mi.Float, dr.width(ray.d))
     return ray
 
+
+def box_contains(p: mi.Point3f, half_extents: mi.Vector3f) -> mi.Bool:
+    r"""
+    Tests whether :math:`\mathbf{p}` lies within the box centered on the origin
+    and spanning ``half_extents`` along every axis
+
+    The test is inclusive up to a numerical tolerance, so that the points lying
+    exactly on a face of the box, which is a common way to place them, are
+    reported as contained.
+
+    :param p: Points to test, in the frame of the box
+    :param half_extents: Half extents of the box along its three axes
+    """
+
+    tolerance = half_extents*EPSILON_FLOAT + EPSILON_FLOAT
+    return dr.all(dr.abs(p) <= (half_extents + tolerance), axis=0)
+
+
+@dataclass
+class SourceExclusionBoxes:
+    # pylint: disable=line-too-long
+    r"""
+    Collection of boxes which do not occlude the rays spawned from their source
+
+    Every source is paired with one box, given by its center, its half extents,
+    and its orientation, and with a flag enabling it. The rays spawned from a
+    source with an enabled box are not tested for occlusion within that box:
+    :meth:`~sionna.rt.utils.SourceExclusionBoxes.advance` moves their origin to
+    the point at which they leave it.
+
+    This is used by :class:`~sionna.rt.rcs.RCSSolver` to keep a sensing
+    target from occluding the scattering points it contains, as the scattering
+    response of a target is entirely described by its scattering model. The
+    box of a scattering point is then the bounding box of its sensing target,
+    and is only enabled if the point lies within it.
+
+    :param centers: Centers of the boxes, one per source
+    :param half_extents: Half extents of the boxes along their three axes, one per source
+    :param orientations: Orientations of the boxes, one per source, specified through three angles :math:`(\alpha, \beta, \gamma)` corresponding to a 3D rotation as defined in :eq:`rotation`
+    :param enabled: Flags enabling the box of every source
+    """
+
+    centers: mi.Point3f
+    half_extents: mi.Vector3f
+    orientations: mi.Point3f
+    enabled: mi.Bool
+
+    def advance(self,
+                o: mi.Point3f,
+                d: mi.Vector3f,
+                indices: mi.UInt) -> Tuple[mi.Point3f, mi.Float]:
+        r"""
+        Moves the origins ``o`` of the rays travelling along ``d`` to the
+        points at which they leave the box of their source
+
+        The returned origins are offset from the face through which the rays
+        leave their box, along the normal to that face, so that the faces of
+        the boxes do not intersect the rays they spawn. The origins of the rays
+        whose box is disabled are returned unchanged.
+
+        The rays are assumed to travel along unit directions, so that the
+        returned distances are lengths and can be compared to the length of a
+        segment. A box being convex, a distance which exceeds the length of a
+        segment means that both of its endpoints lie within the box. The caller
+        is then expected to leave the origin untouched, as the advanced origin
+        would lie beyond the endpoint of the segment, and to test that segment
+        for occlusion over its whole length.
+
+        :param o: Origins of the rays
+        :param d: Unit directions of propagation of the rays
+        :param indices: Index of the source of every ray
+
+        :return: Advanced origins of the rays, and distances by which they were
+            advanced
+        """
+
+        center = dr.gather(mi.Point3f, self.centers, indices)
+        half_extents = dr.gather(mi.Vector3f, self.half_extents, indices)
+        orientation = dr.gather(mi.Point3f, self.orientations, indices)
+        enabled = dr.gather(mi.Bool, self.enabled, indices)
+
+        # The boxes are axis-aligned in the local frame of their source
+        to_world = rotation_matrix(orientation)
+        to_local = to_world.T
+        o_local = to_local@(mi.Point3f(o) - center)
+        d_local = to_local@mi.Vector3f(d)
+
+        # Distance at which the ray reaches the face of the box it travels
+        # towards along each of the three axes. The rays which do not travel
+        # along an axis never reach the faces perpendicular to it.
+        t_axis = dr.select(dr.abs(d_local) > 0.,
+                           (dr.mulsign(half_extents, d_local) - o_local)
+                           /d_local,
+                           dr.inf)
+        # The box is left through the face which is reached first
+        t = dr.minimum(t_axis.x, dr.minimum(t_axis.y, t_axis.z))
+        t = dr.maximum(t, 0.)
+
+        # Outward normal to the face through which the box is left, i.e., the
+        # axis reached first oriented along the direction of propagation
+        exit_x = t_axis.x <= dr.minimum(t_axis.y, t_axis.z)
+        exit_y = ~exit_x & (t_axis.y <= t_axis.z)
+        exit_z = ~exit_x & ~exit_y
+        n_local = mi.Vector3f(
+            dr.select(exit_x, dr.mulsign(mi.Float(1.), d_local.x), 0.),
+            dr.select(exit_y, dr.mulsign(mi.Float(1.), d_local.y), 0.),
+            dr.select(exit_z, dr.mulsign(mi.Float(1.), d_local.z), 0.))
+
+        # Offsetting along the normal to the face, rather than along the
+        # direction of propagation, ensures that the rays which leave their box
+        # at a grazing angle are moved off that face
+        advanced = offset_p(dr.fma(mi.Point3f(d), t, mi.Point3f(o)), d,
+                            to_world@n_local)
+
+        return (dr.select(enabled, advanced, mi.Point3f(o)),
+                dr.select(enabled, t, mi.Float(0.)))
+
+
 def first_order_diffraction_point(s: mi.Point3f,
                                   t: mi.Point3f,
                                   o: mi.Point3f,
@@ -228,10 +347,8 @@ def first_order_diffraction_point(s: mi.Point3f,
     theta = dr.pi - dr.safe_acos(dr.dot(v1, v2))
 
     # Axis of rotation
-    rot_axis = dr.cross(so_perp, to_perp)
-    rot_axis_norm = dr.norm(rot_axis)
-    rot_axis = dr.select(rot_axis_norm > 0, rot_axis * dr.rcp(rot_axis_norm),
-                         zeta)
+    s_ax = dr.dot(dr.cross(so_perp, to_perp), zeta)
+    rot_axis = dr.select(s_ax < 0, -zeta, zeta)
 
     # Apply the rotation
     tc = rotate_vector_around_axis(to, rot_axis, theta)

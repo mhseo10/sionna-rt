@@ -162,6 +162,41 @@ def to_world_jones_rotator(
 
     return rotator
 
+def jones_matrix_from_real_imag(
+    real: mi.Matrix2f,
+    imag: mi.Matrix2f
+) -> mi.Matrix4f:
+    r"""
+    Builds the :math:`4 \times 4` real-valued matrix equivalent to the
+    complex-valued :math:`2 \times 2` Jones matrix :math:`\mathbf{J}` with
+    real component ``real`` and imaginary component ``imag``
+
+    .. math::
+
+        \mathbf{M} =
+            \begin{bmatrix}
+                \begin{array}{c c}
+                    \Re\{\mathbf{J}\} & -\Im\{\mathbf{J}\} \\
+                    \Im\{\mathbf{J}\} &  \Re\{\mathbf{J}\}
+                \end{array}
+            \end{bmatrix}
+
+    The returned matrix operates on Jones vectors represented as real-valued
+    vectors of four dimensions, obtained by concatenating their real and
+    imaginary components, as expected by
+    :func:`~sionna.rt.utils.jones_vec_dot`.
+
+    :param real: Real component of the Jones matrix
+    :param imag: Imaginary component of the Jones matrix
+    """
+
+    return mi.Matrix4f(
+        real[0,0], real[0,1], -imag[0,0], -imag[0,1],
+        real[1,0], real[1,1], -imag[1,0], -imag[1,1],
+        imag[0,0], imag[0,1],  real[0,0],  real[0,1],
+        imag[1,0], imag[1,1],  real[1,0],  real[1,1]
+    )
+
 def jones_matrix_to_world_implicit(
     c1: mi.Complex2f,
     c2: mi.Complex2f,
@@ -272,12 +307,7 @@ def jones_matrix_to_world_implicit(
     imag @= in_rotator
 
     # The Jones matrix is returned as a 4x4 real-valued matrix
-    return mi.Matrix4f(
-        real[0,0], real[0,1], -imag[0,0], -imag[0,1],
-        real[1,0], real[1,1], -imag[1,0], -imag[1,1],
-        imag[0,0], imag[0,1],  real[0,0],  real[0,1],
-        imag[1,0], imag[1,1],  real[1,0],  real[1,1]
-    )
+    return jones_matrix_from_real_imag(real, imag)
 
 def jones_vec_dot(u: mi.Vector4f, v: mi.Vector4f) -> mi.Complex2f:
     # pylint: disable=line-too-long

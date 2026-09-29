@@ -10,19 +10,19 @@ import drjit as dr
 import mitsuba as mi
 import numpy as np
 from ipywidgets import widgets
-from ipywidgets.embed import embed_snippet
 import pythreejs as p3s
 from IPython.display import display
 import matplotlib as mpl
 
 from .constants import InteractionType, LOS_COLOR, SPECULAR_COLOR,\
-    DIFFUSE_COLOR, REFRACTION_COLOR, DIFFRACTION_COLOR,\
+    DIFFUSE_COLOR, REFRACTION_COLOR, DIFFRACTION_COLOR, SENSING_COLOR,\
     INTERACTION_TYPE_TO_COLOR, DEFAULT_TRANSMITTER_COLOR,\
     DEFAULT_RECEIVER_COLOR, DEFAULT_PICKER_COLOR
 from .utils import rotation_matrix, scene_scale
+from .viewer import Viewer, rgb_to_html
 
 
-class Previewer:
+class Previewer(Viewer):
     """
     Interactive preview widget using `pythreejs` for visualizing the
     scene, radio devices, paths, and coverage maps.
@@ -48,48 +48,15 @@ class Previewer:
     def __init__(self, scene, resolution=(655,500), fov=45.,
                  background='white'):
 
-        self._scene = weakref.ref(scene)
-        self._disk_sprite = None
+        super().__init__(resolution=resolution, fov=fov,
+                         background=background)
 
-        # List of objects in the scene
-        self._objects = []
-        # Bounding box of the scene
-        self._bbox = mi.ScalarBoundingBox3f()
+        self._scene = weakref.ref(scene)
+
         # Properties of the clipping plane. We keep them as scene attributes
         # so that clipping can be easy toggled on & off with a widget.
         self._clipping_plane_offset: float | None = None
         self._clipping_plane_orientation: tuple[float, float, float] = (0,0,-1)
-
-        ####################################################
-        # Setup the viewer
-        ####################################################
-
-        # Lighting
-        ambient_light = p3s.AmbientLight(intensity=0.90)
-        camera_light = p3s.DirectionalLight(
-            position=[0, 0, 0], intensity=0.25
-        )
-
-        # Camera & controls
-        self._camera = p3s.PerspectiveCamera(
-            fov=fov, aspect=resolution[0] / resolution[1],
-            up=[0, 0, 1], children=[camera_light],
-        )
-
-        self._orbit = p3s.OrbitControls(
-            controlling = self._camera
-        )
-
-        # Scene & renderer
-        self._p3s_scene = p3s.Scene(
-            background=background, children=[self._camera, ambient_light]
-        )
-        self._renderer = p3s.Renderer(
-            scene=self._p3s_scene, camera=self._camera, controls=[self._orbit],
-            width=resolution[0], height=resolution[1], antialias=True
-        )
-
-        self._legend_labels: dict[str, widgets.HTML] = {}
 
         self._picker_text = widgets.HTML(value="")
         self._picker_mesh: p3s.Mesh | None = None
@@ -107,27 +74,11 @@ class Previewer:
         scene_bbox.expand(self._camera.position)
         self._camera.far = dr.clip(dr.norm(scene_bbox.extents()), 10000, 100000)
 
-    def reset(self):
-        """
-        Removes objects that are not flagged as persistent
-        """
-        remaining = []
-        for obj, persist in self._objects:
-            if persist:
-                remaining.append((obj, persist))
-            else:
-                self._p3s_scene.remove(obj)
-        self._objects = remaining
-
     def display(self):
         """Display the previewer and its companion widgets in a Jupyter
         notebook."""
 
-        legend = widgets.VBox(
-            list(self._legend_labels.values()) + [self._picker_text],
-            layout=widgets.Layout(padding="0 0 0 5px")
-        )
-        display(widgets.HBox([self._renderer, legend]))
+        super().display()
 
         if self.clip_plane_enabled():
             self.display_clipping_plane_slider()
@@ -146,28 +97,6 @@ class Previewer:
 
         # Plot the scene geometry
         self.plot_scene()
-
-    def center_view(self):
-        """
-        Automatically place the camera such that it is located at spherical
-        coordinates (r = scene_scale*3/2, theta=pi/4, phi=pi/4), and oriented
-        toward the center of the scene.
-        """
-        bbox = self._bbox if self._bbox.valid() else mi.ScalarBoundingBox3f(0.)
-        center = bbox.center()
-
-        sc = self._scene_scale()
-        r = sc * 1.5
-        theta = np.pi * 0.25
-        phi = np.pi * 0.25
-        position = (np.sin(theta) * np.cos(phi) * r + center.x,
-                    np.sin(theta) * np.sin(phi) * r + center.y,
-                    np.cos(theta) * r + center.z)
-        self._camera.position = tuple(position)
-
-        self._camera.lookAt(center)
-        self._orbit.exec_three_obj_method('update')
-        self._camera.exec_three_obj_method('updateProjectionMatrix')
 
     def plot_radio_devices(self, show_orientations=False):
         """
@@ -234,48 +163,28 @@ class Previewer:
         self._add_legend(category="devices")
 
         if show_orientations:
-            zeros = np.zeros((3,))
-
             for devices in [scene.transmitters.values(),
                             scene.receivers.values()]:
                 if len(devices) == 0:
                     continue
-                starts, ends, colors = [], [], []
+                starts, ends, colors, head_lengths = [], [], [], []
                 for rd in devices:
                     r = rd.display_radius or default_radius
                     line_length = 1.5 * r
                     head_length = 0.25 * r
 
-                    # Arrow line
-                    color = ", ".join([str(int(255 * v))
-                                       for v in rd.color])
-                    color = f'rgb({color})'
                     rd_pos = rd.position.numpy().squeeze()
                     starts.append(rd_pos)
                     rot_mat = rotation_matrix(rd.orientation)
                     local_endpoint = mi.Point3f(line_length, 0.0, 0.0)
                     endpoint = rd.position + rot_mat @ local_endpoint
-                    endpoint = endpoint.numpy().squeeze()
-                    ends.append(endpoint)
+                    ends.append(endpoint.numpy().squeeze())
                     colors.append(list(rd.color))
+                    head_lengths.append(head_length)
 
-                    geo = p3s.CylinderGeometry(
-                        radiusTop=0, radiusBottom=0.3 * head_length,
-                        height=head_length, radialSegments=8,
-                        heightSegments=0, openEnded=False)
-                    mat = p3s.MeshLambertMaterial(color=color)
-                    mesh = p3s.Mesh(geo, mat)
-
-                    line_dir = dr.normalize(endpoint - rd_pos)
-                    mesh.lookAt(tuple(line_dir))
-                    mesh.rotateX(0.5 * np.pi)
-
-                    mesh.position = tuple(endpoint)
-
-                    self._add_child(mesh, zeros, zeros, persist=False)
-
-                self._plot_lines(np.array(starts), np.array(ends),
-                                 width=2, colors=colors)
+                self._plot_arrows(np.array(starts), np.array(ends),
+                                  np.array(colors), np.array(head_lengths),
+                                  width=2)
 
     def plot_paths(self, paths, line_width=1.0):
         """
@@ -516,18 +425,23 @@ class Previewer:
         """
         Plots the meshes that make the scene
         """
-        objects = self._scene().objects.values()
-        n = len(objects)
-        if n <= 0:
+        scene = self._scene()
+        objects = scene.objects
+        if len(objects) <= 0:
             return
 
         si = dr.zeros(mi.SurfaceInteraction3f)
         si.wi = mi.Vector3f(0, 0, 1)
 
-        # Shapes (e.g. buildings)
-        vertices, faces, albedos = [], [], []
-        f_offset = 0
-        for s in objects:
+        # Since opacity can only be set per draw call, the shapes are grouped
+        # by opacity. Sensing targets are displayed as semi-transparent, and
+        # every other object as fully opaque.
+        sensing_targets = scene.sensing_targets
+        # Map an opacity value to the vertices, faces, and albedos of the
+        # shapes sharing it, and to the vertex offset of the next such shape
+        batches = {}
+        offsets = {}
+        for name, s in objects.items():
 
             s = s.mi_mesh
 
@@ -537,6 +451,16 @@ class Previewer:
                 # include it in the scene preview.
                 continue
 
+            target = sensing_targets.get(name)
+            opacity = target.display_opacity if target is not None else 1.
+            if opacity == 0.:
+                # Fully transparent shapes are not displayed at all
+                continue
+
+            vertices, faces, albedos = batches.setdefault(
+                opacity, ([], [], []))
+            f_offset = offsets.get(opacity, 0)
+
             n_vertices = s.vertex_count()
             v = s.vertex_position(dr.arange(mi.UInt32, n_vertices))
             v = np.transpose(v.numpy())
@@ -545,21 +469,20 @@ class Previewer:
             f = s.face_indices(dr.arange(mi.UInt32, s.face_count()))
             f = np.transpose(f.numpy())
             faces.append(f + f_offset)
-            f_offset += n_vertices
+            offsets[opacity] = f_offset + n_vertices
 
             albedo = np.array(s.bsdf().color)
 
             albedos.append(np.tile(albedo, (n_vertices, 1)))
 
-        # Plot all objects as a single PyThreeJS mesh, which is much faster
-        # than creating individual mesh objects in large scenes.
-        vertices = np.concatenate(vertices, axis=0)
-        faces = np.concatenate(faces, axis=0)
-        albedos = np.concatenate(albedos, axis=0)
-        self._plot_mesh(vertices,
-                        faces,
-                        persist=True, # The scene geometry is persistent
-                        colors=albedos)
+        # Plot the objects of every group as a single PyThreeJS mesh, which is
+        # much faster than creating individual mesh objects in large scenes.
+        for opacity, (vertices, faces, albedos) in batches.items():
+            self._plot_mesh(np.concatenate(vertices, axis=0),
+                            np.concatenate(faces, axis=0),
+                            persist=True, # The scene geometry is persistent
+                            colors=np.concatenate(albedos, axis=0),
+                            opacity=opacity)
 
     def set_clipping_plane(self, offset, orientation):
         """
@@ -749,21 +672,6 @@ class Previewer:
     # Accessors
     ##################################################
 
-    @property
-    def resolution(self) -> tuple[int, int]:
-        """
-        (float, float): Rendering resolution `(width, height)`
-        """
-        return (self._renderer.width, self._renderer.height)
-
-    @property
-    def camera(self) -> p3s.PerspectiveCamera:
-        return self._camera
-
-    @property
-    def orbit(self) -> p3s.OrbitControls:
-        return self._orbit
-
     def clip_plane_enabled(self) -> bool:
         return len(self._renderer.clippingPlanes) > 0
 
@@ -788,162 +696,19 @@ class Previewer:
             sc = 1.
         return sc
 
-    def _plot_mesh(self, vertices, faces, persist, colors=None):
+    def _legend_widgets(self):
+        r"""
+        Returns the widgets making the legend column, i.e. the legend entries
+        followed by the coordinates of the picked point
         """
-        Plots a mesh.
-
-        Input
-        ------
-        vertices: [n,3], float
-            Position of the vertices
-
-        faces: [n,3], int
-            Indices of the triangles associated with ``vertices``
-
-        persist: bool
-            Flag indicating if the mesh is persistent, i.e., should not be
-            erased when ``reset()`` is called.
-
-        colors: [n,3] | [3] | None
-            Colors of the vertices. If `None`, black is used.
-            Defaults to `None`.
-        """
-        if not (vertices.ndim == 2 and vertices.shape[1] == 3):
-            raise ValueError("`vertices` must have shape [n, 3]")
-        if not (faces.ndim == 2 and faces.shape[1] == 3):
-            raise ValueError("`faces` must have shape [n, 3]")
-        n_v = vertices.shape[0]
-        pmin, pmax = np.min(vertices, axis=0), np.max(vertices, axis=0)
-
-        # Assuming per-vertex colors
-        if colors is None:
-            # Black is default
-            colors = np.zeros((n_v, 3), dtype=np.float32)
-        elif colors.ndim == 1:
-            colors = np.tile(colors[None, :], (n_v, 1))
-        colors = colors.astype(np.float32)
-        if not ((colors.ndim == 2)
-                and (colors.shape[1] == 3)
-                and (colors.shape[0] == n_v)):
-            raise ValueError(
-                "`colors` must have shape [n, 3] matching `vertices`")
-
-        # Closer match to Mitsuba and Blender
-        colors = np.power(colors, 1/1.8)
-
-        geo = p3s.BufferGeometry(
-            attributes={
-                'index': p3s.BufferAttribute(faces.ravel(), normalized=False),
-                'position': p3s.BufferAttribute(vertices, normalized=False),
-                'color': p3s.BufferAttribute(colors, normalized=False)
-            }
-        )
-
-        mat = p3s.MeshStandardMaterial(
-            side='DoubleSide', metalness=0., roughness=1.0,
-            vertexColors='VertexColors', flatShading=True,
-        )
-        mesh = p3s.Mesh(geo, mat)
-        self._add_child(mesh, pmin, pmax, persist=persist)
-
-    def _plot_points(self, points: np.ndarray, persist: bool,
-                     colors: np.ndarray | None = None,
-                     radius: float = 0.05):
-        """
-        Plots a set of `n` points.
-
-        Input
-        -------
-        points: [n, 3], float
-            Coordinates of the `n` points.
-
-        persist: bool
-            Indicates if the points are persistent, i.e., should not be erased
-            when ``reset()`` is called.
-
-        colors: [n, 3], float | [3], float | None
-            Colors of the points.
-
-        radius: float
-            Radius of the points.
-        """
-        if not (points.ndim == 2 and points.shape[1] == 3):
-            raise ValueError("`points` must have shape [n, 3]")
-        n = points.shape[0]
-        pmin, pmax = np.min(points, axis=0), np.max(points, axis=0)
-
-        # Assuming per-vertex colors
-        if colors is None:
-            colors = np.zeros((n, 3), dtype=np.float32)
-        elif colors.ndim == 1:
-            colors = np.tile(colors[None, :], (n, 1))
-        colors = colors.astype(np.float32)
-        if not ((colors.ndim == 2)
-                and (colors.shape[1] == 3)
-                and (colors.shape[0] == n)):
-            raise ValueError(
-                "`colors` must have shape [n, 3] matching `points`")
-
-        tex = p3s.DataTexture(data=self._get_disk_sprite(), format="RGBAFormat",
-                              type="FloatType")
-
-        points = points.astype(np.float32)
-        geo = p3s.BufferGeometry(attributes={
-            'position': p3s.BufferAttribute(points, normalized=False),
-            'color': p3s.BufferAttribute(colors, normalized=False),
-        })
-        mat = p3s.PointsMaterial(
-            size=2 * radius, sizeAttenuation=True, vertexColors='VertexColors',
-            map=tex, alphaTest=0.5, transparent=True,
-        )
-        mesh = p3s.Points(geo, mat)
-        self._add_child(mesh, pmin, pmax, persist=persist)
-
-    def _add_child(self, obj, pmin, pmax, persist):
-        """
-        Adds an object for display
-
-        Input
-        ------
-        obj: :class:`~pythreejs.Mesh`
-            Mesh to display
-
-        pmin: [3], float
-            Lowest position for the bounding box
-
-        pmax: [3], float
-            Highest position for the bounding box
-
-        persist: bool
-            Flag that indicates if the object is persistent, i.e., if it should
-            be removed from the display when `reset()` is called.
-        """
-        self._objects.append((obj, persist))
-        self._p3s_scene.add(obj)
-
-        self._bbox.expand(pmin)
-        self._bbox.expand(pmax)
+        return super()._legend_widgets() + [self._picker_text]
 
     def _add_legend(self, category: str):
         r"""
         Add an entry to the legend.
         """
-
-        def circular_item(color):
-            #pylint: disable=unnecessary-semicolon
-            s = f"background-color: {rgb_to_html(color)};" \
-                " width: 20px; height: 20px; border-radius: 50%;" \
-                " margin-right: 5px; display: inline-block;" \
-                " vertical-align: text-bottom;"
-            return s
-
-        def segment_item(color):
-            #pylint: disable=unnecessary-semicolon
-            s = f"background-color: {rgb_to_html(color)};" \
-                " width: 20px; height: 2px;" \
-                " margin-right: 5px; display: inline-block;" \
-                " vertical-align: middle;"
-            return s
+        circular_item = self._circular_legend_item
+        segment_item = self._segment_legend_item
 
         # Create a legend
         legend_items = []
@@ -953,7 +718,8 @@ class Previewer:
                 ("Specular reflection", segment_item(SPECULAR_COLOR)),
                 ("Diffuse reflection", segment_item(DIFFUSE_COLOR)),
                 ("Refraction", segment_item(REFRACTION_COLOR)),
-                ("Diffraction", segment_item(DIFFRACTION_COLOR))
+                ("Diffraction", segment_item(DIFFRACTION_COLOR)),
+                ("Sensing", segment_item(SENSING_COLOR))
             ]
         elif category == "devices":
             legend_items += [
@@ -968,101 +734,7 @@ class Previewer:
         else:
             raise ValueError(f"Invalid legend category: {category}")
 
-        self._legend_labels.update({
-            label: widgets.HTML(value=f"<div style='{style}'></div> {label}")
-            for label, style in legend_items
-        })
-
-    def _plot_lines(self, starts, ends, colors, width):
-        """
-        Plots a set of `n` lines. This is used to plot the paths.
-
-        Input
-        ------
-        starts: [n, 3], float
-            Coordinates of the lines starting points
-
-        ends: [n, 3], float
-            Coordinates of the lines ending points
-
-        color: str
-            Color of the lines.
-
-        width: float
-            Width of the lines.
-        """
-
-        if not (starts.ndim == 2 and starts.shape[1] == 3):
-            raise ValueError("`starts` must have shape [n, 3]")
-        if not (ends.ndim == 2 and ends.shape[1] == 3):
-            raise ValueError("`ends` must have shape [n, 3]")
-        if starts.shape[0] != ends.shape[0]:
-            raise ValueError("`starts` and `ends` must have the same length")
-
-        segments = np.hstack((starts, ends)).astype(np.float32).reshape(-1,2,3)
-        pmin = np.min(segments, axis=(0, 1))
-        pmax = np.max(segments, axis=(0, 1))
-
-        colors = np.hstack((colors, colors)).astype(np.float32).reshape(-1,2,3)
-        geo = p3s.LineSegmentsGeometry(positions=segments, colors=colors)
-        mat = p3s.LineMaterial(linewidth=width, vertexColors='VertexColors')
-        mesh = p3s.LineSegments2(geo, mat)
-
-        # Lines are not flagged as persistent as they correspond to paths, which
-        # can change from one display to the next.
-        self._add_child(mesh, pmin, pmax, persist=False)
-
-    def _get_disk_sprite(self):
-        """
-        Returns the sprite used to represent sources and targets though
-        ``_plot_points()``.
-
-        Output
-        ------
-        : [n,n,4], float
-            Sprite
-        """
-        if self._disk_sprite is not None:
-            return self._disk_sprite
-
-        n = 128
-        sprite = np.ones((n, n, 4))
-        sprite[:, :, 3] = 0.
-        # Draw a disk with an empty circle close to the edge
-        ij = np.mgrid[:n, :n]
-        ij = ij.reshape(2, -1)
-
-        p = (ij + 0.5) / n - 0.5
-        t = np.linalg.norm(p, axis=0).reshape((n, n))
-        inside = t < 0.48
-        in_band = (t < 0.45) & (t > 0.42)
-        sprite[inside & (~in_band), 3] = 1.0
-
-        sprite = sprite.astype(np.float32)
-        self._disk_sprite = sprite
-        return sprite
-
-    # The following methods are required for
-    # integration in Jupyter notebooks
-
-    # pylint: disable=unused-argument
-    def _repr_mimebundle_(self, **kwargs):
-        # pylint: disable=protected-access,not-callable
-        bundle = self._renderer._repr_mimebundle_()
-        if 'text/html' in bundle:
-            raise RuntimeError(
-                "Unexpected 'text/html' entry in renderer MIME bundle")
-        bundle['text/html'] = self._repr_html_()
-        return bundle
-
-    def _repr_html_(self):
-        """
-        Standalone HTML display, i.e. outside of an interactive Jupyter
-        notebook environment.
-        """
-
-        html = embed_snippet(self._renderer, requirejs=True)
-        return html
+        self._add_legend_items(legend_items)
 
     def _coverage_map_color_mapping(self, coverage_map, db_scale=True,
                                     vmin=None, vmax=None, cmap=None):
@@ -1090,13 +762,6 @@ class Previewer:
         else:
             color_map = cmap
         return coverage_map, normalizer, color_map
-
-
-def rgb_to_html(rgb: tuple[float, float, float]) -> str:
-    """
-    Convert an RGB tuple to an HTML color string.
-    """
-    return f"rgb({int(rgb[0] * 255)}, {int(rgb[1] * 255)}, {int(rgb[2] * 255)})"
 
 
 def ray_plane_intersect(

@@ -9,7 +9,7 @@ import mitsuba as mi
 from typing import Tuple
 
 from sionna.rt.utils import spawn_ray_to, offset_p, first_order_diffraction_point,\
-    vector_plane_reflection, point_plane_reflection
+    vector_plane_reflection, point_plane_reflection, SourceExclusionBoxes
 from sionna.rt.constants import InteractionType, MIN_SEGMENT_LENGTH, EPSILON_FLOAT
 from .paths_buffer import PathsBuffer, PathsBufferBase
 
@@ -79,7 +79,8 @@ class ImageMethod:
                  diffraction: bool,
                  diffraction_lit_region: bool,
                  src_positions: mi.Point3f,
-                 tgt_positions: mi.Point3f) -> PathsBuffer:
+                 tgt_positions: mi.Point3f,
+                 src_boxes: SourceExclusionBoxes | None = None) -> PathsBuffer:
         r"""
         Executes the image method
 
@@ -90,6 +91,9 @@ class ImageMethod:
         lit region is enabled
         :param src_positions: Positions of the sources
         :param tgt_positions: Positions of the targets
+        :param src_boxes: Boxes which do not occlude the segments that reach
+        their source, one per source. If :py:class:`None` (default), then these
+        segments are tested for occlusion up to the positions of their source.
 
         :return: Processed paths
         """
@@ -138,7 +142,7 @@ class ImageMethod:
                                           diffraction_lit_region,
                                           paths_targets,
                                           sf_source, sf_start_depth,
-                                          valid_candidate)
+                                          valid_candidate, src_boxes)
 
         ## ## ## ## ## ##
 
@@ -430,7 +434,8 @@ class ImageMethod:
                    paths_targets: mi.Point3f,
                    sf_source: mi.Point3f,
                    sf_start_depth: mi.UInt,
-                   valid_candidate: mi.Bool) -> mi.Bool:
+                   valid_candidate: mi.Bool,
+                   src_boxes: SourceExclusionBoxes | None = None) -> mi.Bool:
         r"""
         Traces backwards from the targets to the images of the sources
 
@@ -452,11 +457,19 @@ class ImageMethod:
         :param sf_source: Positions of the sources of the specular suffixes
         :param sf_start_depth: Depths at which the specular chain starts
         :param valid_candidate: Flags specifying candidates marked as valid
+        :param src_boxes: Boxes which do not occlude the segments that reach
+        their source, one per source
 
         :return: Updated ``valid_candidate`` array
         """
 
         max_depth = paths.max_depth
+
+        # The source of a specular suffix is the source of the path only for
+        # specular chains. For the other paths, it is the vertex of the last
+        # diffuse reflection, which no box may be applied to.
+        is_specular_chain = sf_start_depth == 1
+        src_indices = paths.source_indices
 
         # Diffracting wedges
         wedges = None
@@ -523,6 +536,23 @@ class ImageMethod:
                 active=valid_inter
             )
             k = vertex - ray_target
+
+            # The box of a source does not occlude the segment which reaches
+            # that source, so the ray is stopped where it enters that box. The
+            # endpoint of a ray spawned from a vertex which lies within that
+            # box is left untouched, as the advanced endpoint would lie beyond
+            # that vertex. Such a ray is traced over its whole length, so that
+            # the geometry of the object the box stands for, which may be far
+            # from filling it, does occlude it.
+            if dr.hint(src_boxes is not None, mode="scalar"):
+                advance_to_source = first_segment & is_specular_chain
+                source_distance = dr.norm(k)
+                advanced, advance = src_boxes.advance(
+                    ray_target, k*dr.rcp(source_distance), src_indices)
+                ray_target_offset = dr.select(
+                    advance_to_source & (advance < source_distance),
+                    advanced, ray_target_offset)
+
             ray = spawn_ray_to(vertex_offset,
                                offset_p(ray_target_offset, k, normal_image),
                                normal)

@@ -52,6 +52,30 @@ def test_antenna_pattern_rejects_invalid_patterns_lists():
 
 
 ###########################################
+# AntennaArray position expansion
+###########################################
+
+def test_antenna_array_positions_expands_patterns():
+    array = PlanarArray(num_rows=1, num_cols=2, horizontal_spacing=1.0,
+                        pattern="iso", polarization="VH")
+    wavelength = 2.0
+    normalized = np.array([[0.0, 0.0],
+                           [-0.5, 0.5],
+                           [0.0, 0.0]])
+
+    np.testing.assert_allclose(array.normalized_positions.numpy(), normalized)
+    np.testing.assert_allclose(array.positions(wavelength).numpy(),
+                               normalized*wavelength)
+
+    np.testing.assert_allclose(
+        array.positions(wavelength, expand_patterns=True).numpy(),
+        np.tile(normalized, (1, 2))*wavelength)
+
+    with pytest.raises(TypeError, match="`expand_patterns` must be a bool"):
+        array.positions(wavelength, expand_patterns=1)
+
+
+###########################################
 # RadioDevice validation
 ###########################################
 

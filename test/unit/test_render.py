@@ -17,6 +17,7 @@ import sionna.rt as rt
 from sionna.rt.radio_materials.itu import itu_material
 from sionna.rt.scene import Scene, load_scene
 from sionna.rt import PathSolver, RadioMapSolver
+from sionna.rt.rcs import ScatteringModel, SensingTarget
 from sionna.rt.utils.meshes import transform_mesh
 
 
@@ -375,6 +376,39 @@ def test_render_empty_paths():
     )
     assert isinstance(image, mi.Bitmap)
     assert image.width() == 64 and image.height() == 64
+
+
+def test_render_sensing_target_opacity():
+    """Sensing targets are rendered with their `display_opacity`.
+
+    The scene holds nothing but the target, so the mean alpha measures the
+    fraction of camera rays that the target stopped. A ray crossing the cuboid
+    meets two of its faces, so that fraction is `1 - (1 - opacity)^2` of the
+    fully opaque silhouette.
+    """
+    def mean_alpha(display_opacity):
+        scene = load_scene()
+        scene.edit(add=SensingTarget("st",
+                                     scattering_model=ScatteringModel(),
+                                     length=1., width=1., height=1.,
+                                     display_opacity=display_opacity))
+        to_world = mi.ScalarTransform4f().look_at(origin=[3., 3., 3.],
+                                                  target=[0., 0., 0.],
+                                                  up=[0, 0, 1])
+        image = scene.render(camera=to_world, resolution=(64, 64),
+                             num_samples=64, fov=45, return_bitmap=True)
+        return np.mean(np.array(image, copy=False)[:, :, 3])
+
+    # Silhouette of a fully opaque target, used as the reference coverage
+    silhouette = mean_alpha(1.)
+    assert silhouette > 0.
+
+    for opacity in (0.75, 0.5, 0.25):
+        expected = (1. - (1. - opacity) ** 2) * silhouette
+        assert np.isclose(mean_alpha(opacity), expected, atol=2e-3)
+
+    # A fully transparent target is invisible
+    assert mean_alpha(0.) == 0.
 
 
 def test_render_color_bar_with_named_transmitter():

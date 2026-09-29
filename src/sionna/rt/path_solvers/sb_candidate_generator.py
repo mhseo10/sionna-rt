@@ -12,7 +12,7 @@ from sionna.rt.constants import InteractionType, MIN_SEGMENT_LENGTH,\
     NO_JONES_MATRIX
 from sionna.rt.utils import spawn_ray_from_sources, fibonacci_lattice,\
     spawn_ray_to, sample_wedge_diffraction_point, WedgeGeometry, hash_fnv1a,\
-    PlaneHasher, EdgeHasher
+    PlaneHasher, EdgeHasher, SourceExclusionBoxes
 from .paths_buffer import PathsBuffer
 from .sample_data import SampleData
 
@@ -80,7 +80,9 @@ class SBCandidateGenerator:
                  refraction: bool,
                  diffraction: bool,
                  edge_diffraction: bool,
-                 seed: int = 1) -> PathsBuffer:
+                 seed: int = 1,
+                 src_boxes: SourceExclusionBoxes | None = None
+                 ) -> PathsBuffer:
         # pylint: disable=line-too-long
         r"""
         Instantiates the paths buffer and runs the candidate generator
@@ -98,6 +100,9 @@ class SBCandidateGenerator:
         :param diffraction: If set to `True`, then the diffracted paths are computed
         :param edge_diffraction: If set to `True`, then the diffraction on free floating edges is computed
         :param seed: Seed for the sampler. Defaults to 1.
+        :param src_boxes: Boxes which do not occlude the rays spawned from their
+            source, one per source. If :py:class:`None` (default), then the rays
+            are tested for occlusion from the positions of their source.
 
         :return: Candidate paths
         """
@@ -125,7 +130,7 @@ class SBCandidateGenerator:
         # Test LoS and add valid LoS paths to `paths`
         if los:
             self._los(mi_scene, src_positions, tgt_positions, paths,
-                      paths_counter_per_source)
+                      paths_counter_per_source, src_boxes)
 
         # Run Shooting-and-bouncing of rays if required, i.e., if max_depth > 0
         if max_depth > 0:
@@ -133,7 +138,7 @@ class SBCandidateGenerator:
                     paths, samples_per_src, max_num_paths_per_src, max_depth,
                     paths_counter_per_source, specular_reflection,
                     diffuse_reflection, refraction, diffraction,
-                    edge_diffraction, seed)
+                    edge_diffraction, seed, src_boxes)
 
         return paths
 
@@ -147,7 +152,8 @@ class SBCandidateGenerator:
              src_positions: mi.Point3f,
              tgt_positions: mi.Point3f,
              paths: PathsBuffer,
-             paths_counter_per_source: mi.UInt):
+             paths_counter_per_source: mi.UInt,
+             src_boxes: SourceExclusionBoxes | None = None):
         # pylint: disable=line-too-long
         r"""
         Tests line-of-sight (LoS) paths and add non-obstructed ones to the
@@ -160,6 +166,7 @@ class SBCandidateGenerator:
         :param tgt_positions: Positions of the targets
         :param paths: Paths buffer. Updated in-place.
         :param paths_counter_per_source: Counts the number of paths found for each source
+        :param src_boxes: Boxes which do not occlude the rays spawned from their source, one per source
         """
 
         num_src = dr.width(src_positions)
@@ -179,6 +186,18 @@ class SBCandidateGenerator:
         # Discard LoS paths when sources and targets overlap
         length = dr.norm(targets - origins)
         valid = length > MIN_SEGMENT_LENGTH
+
+        # Move the ray origins out of the boxes which do not occlude them.
+        # The origin of a ray whose target lies within its box is left
+        # untouched, as the advanced origin would lie beyond that target. Such
+        # a ray is tested for occlusion over its whole length, so that the
+        # geometry of the object the box stands for, which may be far from
+        # filling it, does occlude it.
+        if dr.hint(src_boxes is not None, mode="scalar"):
+            advanced, advance = src_boxes.advance(
+                origins, (targets - origins)*dr.rcp(length),
+                samples_data.src_indices)
+            origins = dr.select(advance < length, advanced, origins)
 
         # Test LoS
         rays = spawn_ray_to(origins, targets)
@@ -207,7 +226,8 @@ class SBCandidateGenerator:
                           refraction: bool,
                           diffraction: bool,
                           edge_diffraction: bool,
-                          seed: int):  # pylint: disable=unused-argument
+                          seed: int,  # pylint: disable=unused-argument
+                          src_boxes: SourceExclusionBoxes | None = None):
         # pylint: disable=line-too-long
         r"""
         Executes shooting-and-bouncing of rays
@@ -227,6 +247,7 @@ class SBCandidateGenerator:
         :param refraction: If set to `True`, then the refracted paths are computed
         :param diffraction: If set to `True`, then the diffracted paths are computed
         :param edge_diffraction: If set to `True`, then the diffraction on free floating edges is computed
+        :param src_boxes: Boxes which do not occlude the rays spawned from their source, one per source
         """
 
         # Runs the shooting-and-bouncing of rays loop
@@ -234,7 +255,8 @@ class SBCandidateGenerator:
             self._shoot_and_bounce_loop(mi_scene, src_positions, tgt_positions,
                 samples_per_src, max_num_paths_per_src, max_depth, paths,
                 paths_counter_per_source, specular_reflection, diffuse_reflection,
-                refraction, diffraction, edge_diffraction, self._sampler)
+                refraction, diffraction, edge_diffraction, self._sampler,
+                src_boxes=src_boxes)
 
     @dr.syntax
     def _shoot_and_bounce_loop(self,
@@ -251,7 +273,8 @@ class SBCandidateGenerator:
                                refraction_enabled: bool,
                                diffraction_enabled: bool,
                                edge_diffraction_enabled: bool,
-                               sampler: mi.Sampler):
+                               sampler: mi.Sampler,
+                               src_boxes: SourceExclusionBoxes | None = None):
         # pylint: disable=line-too-long
         """
         Executes shooting-and-bouncing of rays
@@ -272,6 +295,7 @@ class SBCandidateGenerator:
         :param diffraction_enabled: If set to `True`, then the diffracted paths are computed
         :param edge_diffraction_enabled: If set to `True`, then the diffraction on free floating edges is computed
         :param sampler: Sampler used to generate pseudo-random numbers
+        :param src_boxes: Boxes which do not occlude the rays spawned from their source, one per source
         """
 
         num_sources = dr.shape(src_positions)[1]
@@ -285,6 +309,14 @@ class SBCandidateGenerator:
         # Rays
         ray = spawn_ray_from_sources(fibonacci_lattice, samples_per_src,
                                      src_positions)
+
+        # Move the ray origins out of the boxes which do not occlude them.
+        # Only the first segment of a path starts from a source, so this is
+        # done before entering the loop. The directions of propagation are left
+        # untouched, as the origins are moved along them.
+        if dr.hint(src_boxes is not None, mode="scalar"):
+            ray.o, _ = src_boxes.advance(ray.o, ray.d,
+                                         samples_data.src_indices)
 
         # Store direction of departure
         k_tx = dr.copy(ray.d)

@@ -197,7 +197,7 @@ class PathSolver:
                      deterministic results unless the solver is constructed with
                      ``deterministic=True``.
 
-        :return: Computed paths
+        :return: Computed paths, as an instance of :class:`~sionna.rt.Paths`
         """
 
         # Validate public arguments before any allocation or sampling

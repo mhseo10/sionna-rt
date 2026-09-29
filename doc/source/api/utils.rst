@@ -24,6 +24,7 @@ Electromagnetics
 
 Geometry
 --------
+.. autofunction:: sionna.rt.utils.concat_points
 .. autofunction:: sionna.rt.utils.phi_hat
 .. autofunction:: sionna.rt.utils.theta_hat
 .. autofunction:: sionna.rt.utils.r_hat
@@ -37,6 +38,7 @@ Jones calculus
 .. autofunction:: sionna.rt.utils.jones_matrix_rotator
 .. autofunction:: sionna.rt.utils.jones_matrix_rotator_flip_forward
 .. autofunction:: sionna.rt.utils.to_world_jones_rotator
+.. autofunction:: sionna.rt.utils.jones_matrix_from_real_imag
 .. autofunction:: sionna.rt.utils.jones_matrix_to_world_implicit
 .. autofunction:: sionna.rt.utils.jones_vec_dot
 

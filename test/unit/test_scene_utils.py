@@ -12,9 +12,13 @@ import pytest
 
 import mitsuba as mi
 import drjit as dr
+import numpy as np
 from sionna import rt
+from sionna.rt import __version__ as version_str
 from sionna.rt import load_scene, load_scene_from_string, SceneObject, \
-                      RadioMaterial, RadioMaterialBase, ITURadioMaterial
+                      RadioMaterial, RadioMaterialBase, ITURadioMaterial, \
+                      Transmitter, Receiver
+from sionna.rt import scene as scene_module
 from sionna.rt.scene_utils import extend_scene_with_mesh
 
 
@@ -45,7 +49,7 @@ def test02_merge_exclude_regex():
     tmp_path = join(tempfile.gettempdir(), "test_scene_02.xml")
 
     with open(tmp_path, "w") as f:
-        f.write("""<scene version="2.1.0">
+        f.write(f"""<scene version="{version_str}">
     <bsdf type="diffuse" id="itu_wood"/>
 
     <shape type="cube" id="floor">
@@ -84,8 +88,8 @@ def test03_scene_add_remove():
     tmp_path = join(tempfile.gettempdir(), "test_scene_03.xml")
 
     with open(tmp_path, "w") as f:
-            f.write("""
-        <scene version="2.1.0">
+            f.write(f"""
+        <scene version="{version_str}">
 
             <emitter type="constant"/>
 
@@ -190,7 +194,7 @@ def test04_scene_radio_materials():
 
     scene_content = \
     f"""
-    <scene version="2.1.0">
+    <scene version="{version_str}">
 
         <!-- Materials -->
         <bsdf type="diffuse" id="itu_custom">
@@ -336,8 +340,8 @@ def test05_scene_object_scaling():
     tmp_path = join(tempfile.gettempdir(), "test_scene_05.xml")
 
     with open(tmp_path, "w") as f:
-        f.write("""
-        <scene version="2.1.0">
+        f.write(f"""
+        <scene version="{version_str}">
 
             <bsdf type="itu-radio-material" id="bsdf1">
                 <float name="thickness" value="5.65"/>
@@ -458,8 +462,8 @@ def test07_scene_loading_error_messages():
     with pytest.raises(ValueError,
                        match="Found material with name \"mat-concrete\"."
                              " ITU material names must start with"):
-        load_scene_from_string("""
-            <scene version="2.1.0">
+        load_scene_from_string(f"""
+            <scene version="{version_str}">
                 <bsdf type="diffuse" id="mat-concrete"/>
 
                 <shape type="cube" id="shape1">
@@ -472,8 +476,8 @@ def test07_scene_loading_error_messages():
     # wrapped / replaced by a `RuntimeError` in the C++-based XML loader.
     with pytest.raises(RuntimeError,
                        match="Missing property \"type\""):
-        load_scene_from_string("""
-            <scene version="2.1.0">
+        load_scene_from_string(f"""
+            <scene version="{version_str}">
                 <bsdf type="itu-radio-material" id="wet_ground"/>
             </scene>
         """)
@@ -481,8 +485,8 @@ def test07_scene_loading_error_messages():
     # BSDF with no name or ID.
     with pytest.raises(ValueError,
                        match="found BSDF element without 'name'"):
-        load_scene_from_string("""
-            <scene version="2.1.0">
+        load_scene_from_string(f"""
+            <scene version="{version_str}">
                 <bsdf type="itu-radio-material"/>
             </scene>
         """)
@@ -490,8 +494,8 @@ def test07_scene_loading_error_messages():
     # Trying to load a scene with plain visual BSDFs should fail.
     with pytest.raises(ValueError,
                        match=r"Found shape \"shape1\" with associated material \"mat-2f4f4f\", which is not a radio material.*"):
-        load_scene_from_string("""
-            <scene version="2.1.0">
+        load_scene_from_string(f"""
+            <scene version="{version_str}">
                 <bsdf type="diffuse" id="mat-2f4f4f"/>
 
                 <shape type="cube" id="shape1">
@@ -505,8 +509,8 @@ def test07_scene_loading_error_messages():
         """)
 
     # The following should be okay.
-    load_scene_from_string("""
-        <scene version="2.1.0">
+    load_scene_from_string(f"""
+        <scene version="{version_str}">
             <bsdf type="diffuse" id="mat-itu_concrete"/>
             <bsdf type="itu-radio-material" id="wet_ground">
                 <string name="type" value="wet_ground"/>
@@ -605,3 +609,192 @@ def test_use_mi_scene_restores_on_exception():
             assert scene.mi_scene is inner
         assert scene.mi_scene is other
     assert scene.mi_scene is original
+
+
+def count_scene_rebuilds(monkeypatch):
+    """Counts the rebuilds of the Mitsuba scene triggered by scene edits"""
+    rebuilds = []
+    original = scene_module.edit_scene_shapes
+
+    def counting_edit_scene_shapes(*args, **kwargs):
+        rebuilds.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(scene_module, "edit_scene_shapes",
+                        counting_edit_scene_shapes)
+    return rebuilds
+
+
+def make_cars(n, material):
+    """Builds `n` detached scene objects, each at position (i, 0, 0)"""
+    return [SceneObject(fname=rt.scene.low_poly_car,
+                        name=f"car{i}",
+                        radio_material=material,
+                        position=mi.Point3f(i, 0., 0.))
+            for i in range(n)]
+
+
+def test_scene_add_objects_triggers_a_single_rebuild(monkeypatch):
+    scene = load_scene(rt.scene.box, merge_shapes=False)
+    material = ITURadioMaterial("car-mat", "metal", 0.01)
+    cars = make_cars(5, material)
+
+    rebuilds = count_scene_rebuilds(monkeypatch)
+
+    # Adding a batch of pre-positioned objects, along with a radio device,
+    # rebuilds the Mitsuba scene exactly once
+    scene.add(cars + [Transmitter("tx", position=[0., 0., 10.])])
+    assert len(rebuilds) == 1
+
+    assert set(scene.objects) == {"box"} | {f"car{i}" for i in range(5)}
+    assert scene.transmitters == {"tx": scene.get("tx")}
+    for i, car in enumerate(cars):
+        assert scene.get(f"car{i}") is car
+        assert np.allclose(car.position.numpy()[:, 0], [i, 0., 0.], atol=1e-5)
+
+    # Adding objects that are already part of the scene is a no-op
+    rebuilds.clear()
+    scene.add(cars)
+    assert not rebuilds
+    assert len(scene.objects) == 6
+
+
+def test_scene_add_and_remove_objects(monkeypatch):
+    scene = load_scene(rt.scene.box, merge_shapes=False)
+    material = ITURadioMaterial("car-mat", "metal", 0.01)
+    cars = make_cars(3, material)
+    scene.add(cars)
+
+    rebuilds = count_scene_rebuilds(monkeypatch)
+
+    # Objects can be removed by instance, by name, or as a mix of both,
+    # together with radio devices, with a single rebuild
+    rx = Receiver("rx", position=[1., 1., 1.])
+    scene.add(rx)
+    assert not rebuilds
+    scene.remove([cars[0], "car1", "rx"])
+    assert len(rebuilds) == 1
+    assert set(scene.objects) == {"box", "car2"}
+    assert not scene.receivers
+
+    # Unknown names and detached objects are ignored, and do not trigger a
+    # rebuild
+    rebuilds.clear()
+    scene.remove("does-not-exist")
+    scene.remove(cars[0])
+    assert not rebuilds
+    assert set(scene.objects) == {"box", "car2"}
+
+    # A single object can be added and removed as well
+    rebuilds.clear()
+    scene.add(cars[0])
+    assert set(scene.objects) == {"box", "car0", "car2"}
+    scene.remove(cars[0])
+    assert set(scene.objects) == {"box", "car2"}
+    assert len(rebuilds) == 2
+
+
+def test_removed_object_is_detached_from_the_scene():
+    scene = load_scene(rt.scene.box, merge_shapes=False)
+    material = ITURadioMaterial("car-mat", "metal", 0.01)
+    car = SceneObject(fname=rt.scene.low_poly_car, name="car",
+                      radio_material=material)
+
+    scene.add(car)
+    assert car.scene is scene
+    car.position = mi.Point3f(5., 5., 5.)
+
+    scene.remove(car)
+    assert car.scene is None
+
+    # A removed object behaves as a detached one: its geometry is transformed
+    # on its own mesh rather than through the scene it no longer belongs to
+    car.position = mi.Point3f(1., 2., 3.)
+    assert np.allclose(car.position.numpy()[:, 0], [1., 2., 3.], atol=1e-5)
+
+    # It can be added back, and keeps the position it was given meanwhile
+    scene.add(car)
+    assert car.scene is scene
+    assert set(scene.objects) == {"box", "car"}
+    assert np.allclose(car.position.numpy()[:, 0], [1., 2., 3.], atol=1e-5)
+
+    # Objects removed and re-added by the same edit stay attached
+    scene.edit(remove=car, add=car)
+    assert car.scene is scene
+    assert scene.get("car") is car
+
+
+def test_radio_material_is_used_follows_scene_membership():
+    scene = load_scene(rt.scene.box, merge_shapes=False)
+    material = ITURadioMaterial("car-mat", "metal", 0.01)
+    car = SceneObject(fname=rt.scene.low_poly_car, name="car",
+                      radio_material=material)
+
+    # A material is only in use once an object using it is in the scene
+    assert not material.is_used
+    scene.add(car)
+    assert material.is_used
+
+    # Clones that are not part of the scene do not use the material
+    clone = car.clone(name="car-clone")
+    assert material.is_used
+    del clone
+
+    # Once the object leaves the scene, so does the material
+    scene.remove(car)
+    assert not material.is_used
+    scene.remove("car-mat")
+    assert "car-mat" not in scene.radio_materials
+    # Removing the material releases it, so it can be used by another scene
+    assert material.scene is None
+
+    other = load_scene(rt.scene.box, merge_shapes=False)
+    other.add(car)
+    assert other.radio_materials["car-mat"] is material
+    assert material.is_used
+
+
+def test_radio_material_shared_by_several_objects():
+    scene = load_scene(rt.scene.box, merge_shapes=False)
+    material = ITURadioMaterial("shared", "metal", 0.01)
+    spheres = [SceneObject(fname=rt.scene.sphere, name=f"sphere{i}",
+                           radio_material=material)
+               for i in range(2)]
+    scene.add(spheres)
+    assert material.is_used
+
+    # The material stays in use as long as one of its objects is in the scene
+    scene.remove(spheres[0])
+    assert material.is_used
+    with pytest.raises(ValueError, match="still used by at least one object"):
+        scene.remove("shared")
+
+    scene.remove(spheres[1])
+    assert not material.is_used
+    scene.remove("shared")
+    assert "shared" not in scene.radio_materials
+
+
+def test_scene_add_and_remove_input_validation():
+    scene = load_scene(rt.scene.box, merge_shapes=False)
+    material = ITURadioMaterial("car-mat", "metal", 0.01)
+
+    scene.add(SceneObject(fname=rt.scene.low_poly_car, name="car",
+                          radio_material=material))
+
+    # A distinct object reusing the name of an existing item is rejected
+    with pytest.raises(ValueError, match="already used by another item"):
+        scene.add(SceneObject(fname=rt.scene.low_poly_car, name="car",
+                              radio_material=material))
+    with pytest.raises(ValueError, match="already used by another item"):
+        scene.add(Transmitter("car", position=[0., 0., 0.]))
+
+    with pytest.raises(ValueError, match="Cannot add object of type"):
+        scene.add("car")
+
+    with pytest.raises(ValueError, match="must be specified by name"):
+        scene.remove(scene.get("car").radio_material)
+
+    # A radio material in use by an object cannot be removed
+    with pytest.raises(ValueError, match="still used by at least one object"):
+        scene.remove("car-mat")

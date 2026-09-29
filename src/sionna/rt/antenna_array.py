@@ -53,25 +53,37 @@ class AntennaArray:
                             f" AntennaPattern, found type '{type(v)}'.")
         self._antenna_pattern = v
 
-    def positions(self, wavelength: float) -> mi.Point3f:
+    def positions(self,
+                  wavelength: float,
+                  expand_patterns: bool = False) -> mi.Point3f:
         """
         Get the relative positions of all antennas
         (dual-polarized antennas are counted as a single antenna and share the
-        same position).
+        same position unless ``expand_patterns`` is `True`).
 
         Positions are computed by scaling the normalized positions of antennas
         by the ``wavelength``.
 
         :param wavelength: Wavelength [m]
 
+        :param expand_patterns: If `True`, positions are repeated for every
+            antenna pattern in pattern-major ordering. Defaults to `False`.
+
         :returns: Relative antenna positions :math:`(x,y,z)` [m]
         """
-        return self._normalized_positions*wavelength
+        if not isinstance(expand_patterns, bool):
+            raise TypeError("`expand_patterns` must be a bool")
+
+        positions = self.normalized_positions
+        if expand_patterns:
+            num_patterns = len(self.antenna_pattern.patterns)
+            positions = dr.tile(positions, num_patterns)
+        return positions*wavelength
 
     @property
     def normalized_positions(self):
         r"""
-        Get/set  array of relative normalized positions :math:`(x,y,z)`
+        Get/set array of relative normalized positions :math:`(x,y,z)`
         [:math:`\lambda`] of each antenna. Dual-polarized antennas are counted
         as a single antenna and share the same position.
 

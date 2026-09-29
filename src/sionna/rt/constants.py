@@ -29,6 +29,9 @@ class InteractionType:
     #: Diffraction
     DIFFRACTION   = 1 << 3 # 8
 
+    #: Sensing
+    SENSING       = 1 << 4 # 16
+
 #: Default frequency [Hz]
 DEFAULT_FREQUENCY = 3.5e9
 
@@ -50,6 +53,11 @@ DEFAULT_TRANSMITTER_COLOR = (1.0, 0.0, 0.0)
 DEFAULT_RECEIVER_COLOR = (0.4, 0.8, 0.4)
 #: Default color used to visualize picked points in preview (R,G,B)
 DEFAULT_PICKER_COLOR = (0.99, 0.73, 0.01)
+#: Default color used to visualize sensing targets in preview and rendering
+#: (R,G,B)
+DEFAULT_SENSING_TARGET_COLOR = (0.2, 0.4, 1.0)
+#: Default opacity used to visualize sensing targets in preview and rendering
+DEFAULT_SENSING_TARGET_OPACITY = 0.5
 
 #: Color used to visualize line-of-sight path segments (R,G,B)
 LOS_COLOR = (0.5, 0.5, 0.5)
@@ -61,6 +69,8 @@ DIFFUSE_COLOR = (0.6, 1., 0.6)
 REFRACTION_COLOR = (1., 0.6, 0.6)
 #: Color used to visualize diffracted path segments (R,G,B)
 DIFFRACTION_COLOR = (0.6, 0.0, 0.6)
+#: Color used to visualize sensing path segments (R,G,B)
+SENSING_COLOR = (1.0, 0.8, 0.2)
 
 # Maps interaction type to color
 INTERACTION_TYPE_TO_COLOR = {
@@ -69,6 +79,7 @@ INTERACTION_TYPE_TO_COLOR = {
     InteractionType.DIFFUSE: DIFFUSE_COLOR,
     InteractionType.REFRACTION: REFRACTION_COLOR,
     InteractionType.DIFFRACTION: DIFFRACTION_COLOR,
+    InteractionType.SENSING: SENSING_COLOR,
 }
 
 # Flag used to indicate to the radio material that the Jones matrix is not

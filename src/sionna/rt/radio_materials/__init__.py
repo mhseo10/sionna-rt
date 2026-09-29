@@ -7,6 +7,7 @@
 from .radio_material_base import RadioMaterialBase
 from .radio_material import RadioMaterial
 from .itu_material import ITURadioMaterial
+from .absorber_material import AbsorberRadioMaterial
 from .scattering_pattern import register_scattering_pattern, \
                                 scattering_pattern_registry, \
                                 ScatteringPattern, \

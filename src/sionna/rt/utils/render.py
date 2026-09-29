@@ -293,14 +293,18 @@ def unmultiply_alpha(arr: np.ndarray):
     return arr
 
 
-def twosided_diffuse(color: mi.Color3f | list[float]) -> mi.BSDF:
-    return mi.load_dict({
+def twosided_diffuse(color: mi.Color3f | list[float],
+                     opacity: float = 1.) -> mi.BSDF:
+    bsdf = {
         "type": "twosided",
         "nested": {
             "type": "diffuse",
             "reflectance": {"type": "rgb", "value": list(color)},
         }
-    })
+    }
+    if opacity < 1.:
+        bsdf = {"type": "mask", "opacity": opacity, "nested": bsdf}
+    return mi.load_dict(bsdf)
 
 
 def radio_map_to_emissive_shape(radio_map: rt.RadioMap,

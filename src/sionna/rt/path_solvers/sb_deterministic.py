@@ -14,7 +14,7 @@ import mitsuba as mi
 
 from sionna.rt.constants import InteractionType, MIN_SEGMENT_LENGTH
 from sionna.rt.utils import spawn_ray_from_sources, fibonacci_lattice,\
-    hash_fnv1a, spawn_ray_to
+    hash_fnv1a, spawn_ray_to, SourceExclusionBoxes
 from .paths_buffer import PathsBuffer
 from .sample_data import SampleData, source_index_per_sample
 from .sb_candidate_generator import SBCandidateGenerator
@@ -37,7 +37,8 @@ class SBDeterministicCandidateGenerator(SBCandidateGenerator):
              src_positions: mi.Point3f,
              tgt_positions: mi.Point3f,
              paths: PathsBuffer,
-             paths_counter_per_source: mi.UInt):
+             paths_counter_per_source: mi.UInt,
+             src_boxes: SourceExclusionBoxes | None = None):
         # pylint: disable=line-too-long
         """
         Tests line-of-sight (LoS) paths and add non-obstructed ones to the
@@ -50,6 +51,7 @@ class SBDeterministicCandidateGenerator(SBCandidateGenerator):
         :param tgt_positions: Positions of the targets
         :param paths: Paths buffer. Updated in-place.
         :param paths_counter_per_source: Counts the number of paths found for each source
+        :param src_boxes: Boxes which do not occlude the rays spawned from their source, one per source
         """
 
         num_src = dr.width(src_positions)
@@ -69,6 +71,18 @@ class SBDeterministicCandidateGenerator(SBCandidateGenerator):
         # Discard LoS paths when sources and targets overlap
         length = dr.norm(targets - origins)
         valid = length > MIN_SEGMENT_LENGTH
+
+        # Move the ray origins out of the boxes which do not occlude them.
+        # The origin of a ray whose target lies within its box is left
+        # untouched, as the advanced origin would lie beyond that target. Such
+        # a ray is tested for occlusion over its whole length, so that the
+        # geometry of the object the box stands for, which may be far from
+        # filling it, does occlude it.
+        if src_boxes is not None:
+            advanced, advance = src_boxes.advance(
+                origins, (targets - origins)*dr.rcp(length),
+                samples_data.src_indices)
+            origins = dr.select(advance < length, advanced, origins)
 
         # Test LoS
         rays = spawn_ray_to(origins, targets)
@@ -112,6 +126,7 @@ class SBDeterministicCandidateGenerator(SBCandidateGenerator):
         diffraction: bool,
         edge_diffraction: bool,
         seed: int,
+        src_boxes: SourceExclusionBoxes | None = None,
     ):
         loop_args = (
             mi_scene,
@@ -144,6 +159,7 @@ class SBDeterministicCandidateGenerator(SBCandidateGenerator):
                     *loop_args,
                     self._sampler,
                     counting_mode=True,
+                    src_boxes=src_boxes,
                 )
             )
 
@@ -255,6 +271,7 @@ class SBDeterministicCandidateGenerator(SBCandidateGenerator):
                 self._sampler,
                 output_offset=output_offset,
                 thread_has_output=thread_has_output,
+                src_boxes=src_boxes,
             )
 
         paths.advance_paths_counter(
@@ -281,6 +298,7 @@ class SBDeterministicCandidateGenerator(SBCandidateGenerator):
         diffraction_enabled: bool,
         edge_diffraction_enabled: bool,
         sampler: mi.Sampler,
+        src_boxes: SourceExclusionBoxes | None = None,
         counting_mode: bool = False,
         output_offset: mi.UInt32 | None = None,
         thread_has_output: mi.Mask | None = None,
@@ -305,6 +323,7 @@ class SBDeterministicCandidateGenerator(SBCandidateGenerator):
         :param diffraction_enabled: If set to `True`, then the diffracted paths are computed
         :param edge_diffraction_enabled: If set to `True`, then the diffraction on free floating edges is computed
         :param sampler: Sampler used to generate pseudo-random numbers
+        :param src_boxes: Boxes which do not occlude the rays spawned from their source, one per source
         """
         assert counting_mode or (
             output_offset is not None
@@ -316,6 +335,15 @@ class SBDeterministicCandidateGenerator(SBCandidateGenerator):
 
         # Rays
         ray = spawn_ray_from_sources(fibonacci_lattice, samples_per_src, src_positions)
+
+        # Move the ray origins out of the boxes which do not occlude them.
+        # Only the first segment of a path starts from a source, so this is
+        # done before entering the loop. The directions of propagation are left
+        # untouched, as the origins are moved along them.
+        if dr.hint(src_boxes is not None, mode="scalar"):
+            ray.o, _ = src_boxes.advance(
+                ray.o, ray.d,
+                source_index_per_sample(num_sources, samples_per_src))
 
         # Store direction of departure
         k_tx = dr.copy(ray.d)

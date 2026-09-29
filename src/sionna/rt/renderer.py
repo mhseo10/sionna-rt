@@ -308,9 +308,15 @@ def visual_scene_from_wireless_scene(scene: rt.Scene,
     result["emitter"] = emitter
 
     # --- Visual BSDFs
+    # Sensing targets are displayed as semi-transparent, so that their
+    # scattering points remain visible. Every target owns a distinct material,
+    # so their opacity can be looked up by material name.
+    st_opacity = {t.radio_material.name: t.display_opacity
+                  for t in scene.sensing_targets.values()}
     bsdfs = {}
     for name, mat in scene.radio_materials.items():
-        bsdfs[name] = twosided_diffuse(mat.color)
+        bsdfs[name] = twosided_diffuse(mat.color,
+                                       opacity=st_opacity.get(name, 1.))
 
     # Default BSDF
     default_bsdf = twosided_diffuse((0.7,0.7,0.7))

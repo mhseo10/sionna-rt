@@ -77,6 +77,9 @@ class Scene:
 
         # Scene objects
         self._scene_objects = {}
+        # Sensing targets, i.e., the subset of the scene objects that are
+        # instances of SensingTarget
+        self._sensing_targets = {}
 
         # Radio devices
         self._transmitters = {}
@@ -244,6 +247,15 @@ class Scene:
         """
         return dict(self._receivers)
 
+    @property
+    def sensing_targets(self):
+        """
+        :py:class:`dict`, { "name", :class:`~sionna.rt.rcs.SensingTarget`}:
+            Dictionary of sensing targets, i.e., of the scene objects that are
+            instances of :class:`~sionna.rt.rcs.SensingTarget`
+        """
+        return dict(self._sensing_targets)
+
     def get(self, name: str) -> (
         None |
         sionna.rt.SceneObject |
@@ -267,71 +279,126 @@ class Scene:
         return None
 
     def add(self,
-            item: (sionna.rt.RadioDevice |
-                   RadioMaterialBase)
+            item: (sionna.rt.SceneObject |
+                   sionna.rt.RadioDevice |
+                   RadioMaterialBase |
+                   list[sionna.rt.SceneObject |
+                        sionna.rt.RadioDevice |
+                        RadioMaterialBase])
     ) -> None:
         # pylint: disable=line-too-long
         r"""
-        Adds a radio device or radio material to the scene
+        Adds one or more scene objects, radio devices, or radio materials to the
+        scene
 
-        If a different item with the same name as ``item`` is part of
-        the scene, an error is raised.
+        If a different item with the same name as one of the added items is
+        part of the scene, an error is raised. Items that are already part of
+        the scene are skipped.
 
-        :param item: Item to be added to the scene
+        Adding a scene object requires rebuilding the Mitsuba scene, which is
+        done through :meth:`~sionna.rt.Scene.edit`. It is therefore
+        significantly more efficient to add scene objects by batch, i.e., as a
+        list, than one by one, as a single rebuild is then required:
+
+        .. code-block:: python
+
+            # Efficient: a single rebuild of the scene
+            scene.add([obj1, obj2, obj3])
+
+            # Inefficient: one rebuild per object
+            for obj in [obj1, obj2, obj3]:
+                scene.add(obj)
+
+        Similarly, if an edit of the scene requires both adding and removing
+        scene objects, using :meth:`~sionna.rt.Scene.edit` is more efficient
+        than calling :meth:`~sionna.rt.Scene.add` and
+        :meth:`~sionna.rt.Scene.remove`, as it performs both operations at once,
+        i.e., with a single rebuild of the scene.
+
+        :param item: Item, or list of items, to be added to the scene
         """
-        if not isinstance(item, (RadioMaterialBase, Transmitter, Receiver)):
-            raise ValueError(
-                f"Cannot add object of type {type(item)} to the scene."
-                " The input must be a Transmitter, Receiver,"
-                " or RadioMaterialBase.")
+        items = item if isinstance(item, (list, tuple)) else [item]
 
-        name = item.name
-        s_item = self.get(name)
-        if s_item is not None:
-            if s_item is not item:
-                raise ValueError(f"Name '{name}' is already used by another item"
-                                 " of the scene")
+        # Scene objects are gathered and added through a single call to
+        # `edit()`, as each call rebuilds the Mitsuba scene
+        scene_objects = []
+        for i in items:
+            if isinstance(i, sionna.rt.SceneObject):
+                if self._check_name_available(i):
+                    scene_objects.append(i)
+            else:
+                self._add_non_geometric_item(i)
 
-            # This exact item was already added, skip it.
-            return
+        if scene_objects:
+            self.edit(add=scene_objects)
 
-        if isinstance(item, RadioMaterialBase):
-            item.scene = self
-            self._radio_materials[name] = item
-        elif isinstance(item, Transmitter):
-            self._transmitters[name] = item
-        else:
-            self._receivers[name] = item
-
-    def remove(self, name: str) -> None:
+    def remove(self,
+               item: (str |
+                      sionna.rt.SceneObject |
+                      list[str | sionna.rt.SceneObject])
+    ) -> None:
         # pylint: disable=line-too-long
         """
-        Removes a radio device or radio material from the scene
+        Removes one or more scene objects, radio devices, or radio materials
+        from the scene
+
+        Items can be specified either by name or, for scene objects, by
+        instance. Names and objects that are not part of the scene are ignored.
 
         In the case of a radio material, it must not be used by any object of
         the scene.
 
-        :param name: Name of the item to be removed
-        """
-        if not isinstance(name, str):
-            raise ValueError("The input should be a string")
-        item = self.get(name)
+        As for :meth:`~sionna.rt.Scene.add`, removing a scene object requires
+        rebuilding the Mitsuba scene through :meth:`~sionna.rt.Scene.edit`. It
+        is therefore significantly more efficient to remove scene objects by
+        batch, i.e., as a list, than one by one. If an edit of the scene
+        requires both adding and removing scene objects, using
+        :meth:`~sionna.rt.Scene.edit` is more efficient, as it performs both
+        operations with a single rebuild of the scene.
 
-        if item is None:
-            pass
-        elif isinstance(item, RadioMaterialBase):
-            if item.is_used:
-                raise ValueError(f"Cannot remove the radio material '{name}'"
-                                  " because it is still used by at least one"
-                                  " object")
-            del self._radio_materials[name]
-        elif isinstance(item, Transmitter):
-            del self._transmitters[name]
-        elif isinstance(item, Receiver):
-            del self._receivers[name]
-        else:
-            raise TypeError("Only Transmitters, Receivers, or RadioMaterials"
-                            " can be removed")
+        :param item: Name or instance, or list of names or instances, of the
+            items to be removed
+        """
+        items = item if isinstance(item, (list, tuple)) else [item]
+
+        # As for `add()`, scene objects are removed through a single call to
+        # `edit()`
+        scene_objects = []
+        for i in items:
+            if isinstance(i, sionna.rt.SceneObject):
+                # Objects that are not part of the scene are ignored, as are
+                # unused names
+                if self._scene_objects.get(i.name) is i:
+                    scene_objects.append(i)
+                continue
+
+            if not isinstance(i, str):
+                raise ValueError("Items to remove must be specified by name"
+                                 f" (str) or instance, found {type(i)}")
+
+            s_item = self.get(i)
+            if s_item is None:
+                pass
+            elif isinstance(s_item, sionna.rt.SceneObject):
+                scene_objects.append(s_item)
+            elif isinstance(s_item, RadioMaterialBase):
+                if s_item.is_used:
+                    raise ValueError(f"Cannot remove the radio material '{i}'"
+                                      " because it is still used by at least"
+                                      " one object")
+                del self._radio_materials[i]
+                # pylint: disable=protected-access
+                s_item._detach_from_scene()
+            elif isinstance(s_item, Transmitter):
+                del self._transmitters[i]
+            elif isinstance(s_item, Receiver):
+                del self._receivers[i]
+            else:
+                raise TypeError("Only SceneObjects, Transmitters, Receivers, or"
+                                " RadioMaterials can be removed")
+
+        if scene_objects:
+            self.edit(remove=scene_objects)
 
     def edit(self,
              add: (sionna.rt.SceneObject |
@@ -346,16 +413,20 @@ class Scene:
         r"""
         Add and/or remove a list of objects to/from the scene
 
-        To optimize performance and reduce processing time, it is recommended
+        Each call to this function rebuilds the Mitsuba scene. To optimize
+        performance and reduce processing time, it is therefore recommended
         to use a single call to this function with a list of objects to add
         and/or remove, rather than making multiple individual calls to edit
-        scene objects.
+        scene objects. In particular, this function should be preferred over
+        :meth:`~sionna.rt.Scene.add` and :meth:`~sionna.rt.Scene.remove` when
+        an edit of the scene requires both adding and removing objects, as it
+        performs both operations with a single rebuild.
 
         :param add: Object, list of objects, or Mitsuba shape dictionary
             (accepted by ``mitsuba.load_dict``) to be added
 
         :param remove: Name or object, or list/dictionary of objects or names
-            to be added
+            to be removed
         """
 
         # Set the Mitsuba scene to the edited scene
@@ -364,12 +435,16 @@ class Scene:
         # Reset the scene params
         self._scene_params = mi.traverse(self._scene)
 
+        # Objects that were part of the scene before this edit. Those that are
+        # no longer part of it are detached from the scene further below.
+        previous_objects = dict(self._scene_objects)
+
         # Update the scene objects.
         # Scene objects are not re-instantiated to keep the instances held by
         # the users valid. Mitsuba shape dictionaries (and other non-SceneObject
         # entries) have no wrapper yet; those are created below for any shape
         # that is not already tracked.
-        scene_objects = dict(self._scene_objects)
+        scene_objects = dict(previous_objects)
         if add is not None:
             if isinstance(add, sionna.rt.SceneObject):
                 items = [add]
@@ -382,6 +457,7 @@ class Scene:
                     scene_objects[o.name] = o
 
         self._scene_objects = {}
+        self._sensing_targets = {}
         for s in self._scene.shapes():
             name = sionna.rt.SceneObject.shape_id_to_name(s.id())
             obj = scene_objects.get(name)
@@ -392,6 +468,13 @@ class Scene:
             else:
                 obj.mi_mesh = s
             self._add_scene_object(obj)
+
+        # Objects that left the scene no longer belong to it. Detaching them
+        # makes their geometry editable again, and allows adding them to
+        # another scene.
+        for name, obj in previous_objects.items():
+            if self._scene_objects.get(name) is not obj:
+                obj._detach_from_scene()  # pylint: disable=protected-access
 
         # Reset the preview widget to ensure the preview is redraw
         self.scene_geometry_updated()
@@ -929,6 +1012,59 @@ class Scene:
         finally:
             self._scene = old_scene
 
+    def _check_name_available(self, item) -> bool:
+        r"""
+        Checks that the name of ``item`` is not already used by another item of
+        the scene
+
+        :param item: Item to be added to the scene
+
+        :return: `True` if ``item`` must be added to the scene, and `False` if
+            it is already part of it
+
+        :raises ValueError: If the name of ``item`` is used by another item
+        """
+        name = item.name
+        s_item = self.get(name)
+        if s_item is None:
+            return True
+        if s_item is not item:
+            raise ValueError(f"Name '{name}' is already used by another item"
+                             " of the scene")
+        # This exact item was already added, skip it
+        return False
+
+    def _add_non_geometric_item(self,
+                                item: (sionna.rt.RadioDevice |
+                                       RadioMaterialBase)
+    ) -> None:
+        r"""
+        Adds a radio device or radio material to the scene
+
+        Unlike scene objects, these items do not contribute to the geometry of
+        the scene, and adding them therefore does not require rebuilding the
+        Mitsuba scene.
+
+        :param item: Item to be added to the scene
+        """
+        if not isinstance(item, (RadioMaterialBase, Transmitter, Receiver)):
+            raise ValueError(
+                f"Cannot add object of type {type(item)} to the scene."
+                " The input must be a SceneObject, Transmitter, Receiver, or"
+                " RadioMaterialBase.")
+
+        if not self._check_name_available(item):
+            return
+
+        name = item.name
+        if isinstance(item, RadioMaterialBase):
+            item.scene = self
+            self._radio_materials[name] = item
+        elif isinstance(item, Transmitter):
+            self._transmitters[name] = item
+        else:
+            self._receivers[name] = item
+
     def _load_scene_objects(self, remove_duplicate_vertices: bool):
         """
         Builds Sionna SceneObject instances from the Mistuba scene
@@ -979,15 +1115,8 @@ class Scene:
         if not isinstance(scene_object, sionna.rt.SceneObject):
             raise ValueError("The input must be a SceneObject")
 
-        name = scene_object.name
-        s_item = self.get(name)
-        if s_item is not None:
-            if s_item is not scene_object:
-                raise ValueError(f"Name '{name}' is already used by another item"
-                                 " of the scene")
-            else:
-                # This item was already added.
-                return
+        if not self._check_name_available(scene_object):
+            return
 
         # Add the scene object and its material
 
@@ -997,6 +1126,13 @@ class Scene:
                              " material assigned to it")
         scene_object.scene = self
         self._scene_objects[scene_object.name] = scene_object
+        # Sensing targets are also tracked separately, as the RCS solver only
+        # operates on them.
+        # Imported here to avoid a circular import, as the RCS module depends
+        # on this module
+        from .rcs import SensingTarget # pylint: disable=import-outside-toplevel
+        if isinstance(scene_object, SensingTarget):
+            self._sensing_targets[scene_object.name] = scene_object
         # Add the scene object radio material as well
         self.add(scene_object.radio_material)
 
